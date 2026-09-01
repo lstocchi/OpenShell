@@ -272,6 +272,7 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
             "mTLS user authentication requires --tls-client-ca so client certificates can be verified."
         ));
     }
+    #[cfg(unix)]
     if mtls_auth_enabled
         && matches!(
             effective_single_driver(args),
@@ -700,6 +701,7 @@ fn normalize_compute_driver_socket_args(args: &mut RunArgs, matches: &ArgMatches
         [driver] => {
             let driver = openshell_core::config::normalize_compute_driver_name(driver)
                 .map_err(|err| miette::miette!("{err}"))?;
+            #[cfg(unix)]
             if matches!(
                 driver.parse::<ComputeDriverKind>().ok(),
                 Some(
@@ -711,6 +713,15 @@ fn normalize_compute_driver_socket_args(args: &mut RunArgs, matches: &ArgMatches
             ) {
                 return Err(miette::miette!(
                     "--compute-driver-socket cannot be combined with reserved built-in compute driver '{driver}'"
+                ));
+            }
+            #[cfg(windows)]
+            if matches!(
+                driver.parse::<ComputeDriverKind>().ok(),
+                Some(ComputeDriverKind::Vm)
+            ) {
+                return Err(miette::miette!(
+                    "--compute-driver-socket cannot be combined with unsupported or reserved built-in compute driver '{driver}'"
                 ));
             }
             args.drivers[0] = driver;
@@ -731,10 +742,19 @@ fn effective_single_driver(args: &RunArgs) -> Option<ComputeDriverKind> {
     }
 }
 
+#[cfg(unix)]
 fn is_singleplayer_driver(args: &RunArgs) -> bool {
     matches!(
         effective_single_driver(args),
         Some(ComputeDriverKind::Docker | ComputeDriverKind::Podman | ComputeDriverKind::Vm)
+    )
+}
+
+#[cfg(windows)]
+fn is_singleplayer_driver(args: &RunArgs) -> bool {
+    matches!(
+        effective_single_driver(args),
+        Some(ComputeDriverKind::Vm)
     )
 }
 
@@ -1763,6 +1783,7 @@ mem_mib = "not-a-number"
         assert!(file.openshell.drivers.contains_key("vm"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn driver_inherits_shared_image_from_gateway_section() {
         // [openshell.gateway].default_image inherits into the K8s driver
@@ -1788,6 +1809,7 @@ namespace = "agents"
         assert_eq!(parsed.namespace, "agents");
     }
 
+    #[cfg(unix)]
     #[test]
     fn driver_specific_value_overrides_gateway_inheritance() {
         let file = config_file_from_toml(

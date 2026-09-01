@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod driver;
+#[cfg(target_os = "windows")]
+pub mod e2fs_vm;
 mod embedded_runtime;
 mod ffi;
 pub mod gpu;

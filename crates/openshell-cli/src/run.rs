@@ -4351,8 +4351,12 @@ fn read_gcloud_adc() -> Result<(String, String, String)> {
     {
         PathBuf::from(config_dir).join("application_default_credentials.json")
     } else {
+        #[cfg(unix)]
         let home = std::env::var("HOME")
             .map_err(|_| miette::miette!("HOME is not set; cannot locate gcloud ADC file"))?;
+        #[cfg(windows)]
+        let home = std::env::var("USERPROFILE")
+            .map_err(|_| miette::miette!("USERPROFILE is not set; cannot locate gcloud ADC file"))?;
         PathBuf::from(home)
             .join(".config")
             .join("gcloud")

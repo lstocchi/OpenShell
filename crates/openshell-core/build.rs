@@ -29,6 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: This is run at build time in a single-threaded build script context.
     // No other threads are reading environment variables concurrently.
     #[allow(unsafe_code)]
+    #[cfg(not(target_os = "windows"))]
     unsafe {
         env::set_var("PROTOC", protobuf_src::protoc());
     }

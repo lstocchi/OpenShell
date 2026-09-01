@@ -116,6 +116,14 @@ case "$PLATFORM" in
             fi
         done
         ;;
+    windows-x86_64|windows-*)
+        for f in libkrun.dll.zst libkrunfw.dll.zst gvproxy.exe.zst umoci.zst; do
+            if [ ! -f "${OUTPUT_DIR}/${f}" ]; then
+                echo "ERROR: Missing ${OUTPUT_DIR}/${f}" >&2
+                missing=1
+            fi
+        done
+        ;;
 esac
 
 if [ "$missing" -eq 1 ]; then

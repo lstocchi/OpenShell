@@ -330,6 +330,7 @@ pub(crate) async fn run_server(
     // env var) and has a sandbox JWT issuer to mint replacements against;
     // outside the cluster we can't call the apiserver's TokenReview API,
     // and without the issuer there's nothing to exchange the SA token for.
+    #[cfg(unix)]
     if state.sandbox_jwt_issuer.is_some() && std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
         // Pod lookups and TokenReview identity checks must match the sandbox
         // namespace and service account used by the Kubernetes driver.
@@ -740,6 +741,7 @@ async fn build_compute_runtime(
     info!(driver = %driver.name(), "Using compute driver");
 
     let runtime = match driver {
+        #[cfg(unix)]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Kubernetes) => {
             warn_if_kubernetes_sandbox_jwt_expiry_disabled(config);
             let k8s_config =
@@ -754,6 +756,7 @@ async fn build_compute_runtime(
             )
             .await
         }
+        #[cfg(unix)]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Docker) => {
             let docker_config = compute::driver_config::docker_config_from_context(driver_startup)?;
             ComputeRuntime::new_docker(
@@ -767,6 +770,7 @@ async fn build_compute_runtime(
             )
             .await
         }
+        #[cfg(unix)]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Podman) => {
             let podman_config = compute::driver_config::podman_config_from_context(driver_startup)?;
             ComputeRuntime::new_podman(

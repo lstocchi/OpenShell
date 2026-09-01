@@ -13,6 +13,7 @@ mod resources {
     pub const GVPROXY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gvproxy.zst"));
     pub const LIBKRUN_NAME: &str = "libkrun.dylib";
     pub const LIBKRUNFW_NAME: &str = "libkrunfw.5.dylib";
+    pub const GVPROXY_NAME: &str = "gvproxy";
 }
 
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -22,6 +23,7 @@ mod resources {
     pub const GVPROXY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gvproxy.zst"));
     pub const LIBKRUN_NAME: &str = "libkrun.so";
     pub const LIBKRUNFW_NAME: &str = "libkrunfw.so.5";
+    pub const GVPROXY_NAME: &str = "gvproxy";
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -31,12 +33,24 @@ mod resources {
     pub const GVPROXY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gvproxy.zst"));
     pub const LIBKRUN_NAME: &str = "libkrun.so";
     pub const LIBKRUNFW_NAME: &str = "libkrunfw.so.5";
+    pub const GVPROXY_NAME: &str = "gvproxy";
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+mod resources {
+    pub const LIBKRUN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libkrun.dll.zst"));
+    pub const LIBKRUNFW: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libkrunfw.dll.zst"));
+    pub const GVPROXY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gvproxy.exe.zst"));
+    pub const LIBKRUN_NAME: &str = "libkrun.dll";
+    pub const LIBKRUNFW_NAME: &str = "libkrunfw.dll";
+    pub const GVPROXY_NAME: &str = "gvproxy.exe";
 }
 
 #[cfg(not(any(
     all(target_os = "macos", target_arch = "aarch64"),
     all(target_os = "linux", target_arch = "aarch64"),
     all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "windows", target_arch = "x86_64"),
 )))]
 mod resources {
     pub const LIBKRUN: &[u8] = &[];
@@ -44,6 +58,7 @@ mod resources {
     pub const GVPROXY: &[u8] = &[];
     pub const LIBKRUN_NAME: &str = "libkrun";
     pub const LIBKRUNFW_NAME: &str = "libkrunfw";
+    pub const GVPROXY_NAME: &str = "gvproxy";
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -82,7 +97,7 @@ pub fn ensure_runtime_extracted() -> Result<PathBuf, String> {
         resources::LIBKRUNFW,
         &cache_dir.join(resources::LIBKRUNFW_NAME),
     )?;
-    extract_resource(resources::GVPROXY, &cache_dir.join("gvproxy"))?;
+    extract_resource(resources::GVPROXY, &cache_dir.join(resources::GVPROXY_NAME))?;
 
     #[cfg(target_os = "macos")]
     {
@@ -99,7 +114,7 @@ pub fn ensure_runtime_extracted() -> Result<PathBuf, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(cache_dir.join("gvproxy"), fs::Permissions::from_mode(0o755))
+        fs::set_permissions(cache_dir.join(resources::GVPROXY_NAME), fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("chmod gvproxy: {e}"))?;
     }
 
@@ -109,7 +124,7 @@ pub fn ensure_runtime_extracted() -> Result<PathBuf, String> {
 pub fn validate_runtime_dir(dir: &Path) -> Result<(), String> {
     let libkrun = dir.join(resources::LIBKRUN_NAME);
     let libkrunfw = dir.join(resources::LIBKRUNFW_NAME);
-    let gvproxy = dir.join("gvproxy");
+    let gvproxy = dir.join(resources::GVPROXY_NAME);
 
     for path in [&libkrun, &libkrunfw, &gvproxy] {
         if !path.is_file() {

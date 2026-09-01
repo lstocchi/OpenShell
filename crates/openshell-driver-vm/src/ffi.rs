@@ -35,6 +35,13 @@ type KrunAddDisk = unsafe extern "C" fn(
     disk_path: *const c_char,
     read_only: bool,
 ) -> i32;
+type KrunAddDisk2 = unsafe extern "C" fn(
+    ctx_id: u32,
+    block_id: *const c_char,
+    disk_path: *const c_char,
+    format: u32,
+    read_only: bool,
+) -> i32;
 type KrunSetRootDiskRemount = unsafe extern "C" fn(
     ctx_id: u32,
     device: *const c_char,
@@ -61,10 +68,25 @@ type KrunAddNetUnixgram = unsafe extern "C" fn(
     features: u32,
     flags: u32,
 ) -> i32;
+type KrunAddVirtiofs = unsafe extern "C" fn(
+    ctx_id: u32,
+    tag: *const c_char,
+    path: *const c_char,
+) -> i32;
+#[cfg(unix)]
 type KrunAddNetUnixstream = unsafe extern "C" fn(
     ctx_id: u32,
     c_path: *const c_char,
     fd: i32,
+    c_mac: *const u8,
+    features: u32,
+    flags: u32,
+) -> i32;
+#[cfg(windows)]
+type KrunAddNetUnixstream = unsafe extern "C" fn(
+    ctx_id: u32,
+    c_path: *const c_char,
+    fd: u64,
     c_mac: *const u8,
     features: u32,
     flags: u32,
@@ -79,13 +101,17 @@ pub struct LibKrun {
     pub krun_free_ctx: KrunFreeCtx,
     pub krun_set_vm_config: KrunSetVmConfig,
     pub krun_add_disk: KrunAddDisk,
+    pub krun_add_disk2: KrunAddDisk2,
     pub krun_set_root_disk_remount: KrunSetRootDiskRemount,
     pub krun_set_workdir: KrunSetWorkdir,
     pub krun_set_exec: KrunSetExec,
+    #[cfg(unix)]
     pub krun_set_console_output: KrunSetConsoleOutput,
     pub krun_start_enter: KrunStartEnter,
+    #[cfg(unix)]
     pub krun_disable_implicit_vsock: KrunDisableImplicitVsock,
     pub krun_add_vsock: KrunAddVsock,
+    pub krun_add_virtiofs: KrunAddVirtiofs,
     #[cfg(target_os = "macos")]
     pub krun_add_net_unixgram: KrunAddNetUnixgram,
     #[allow(dead_code)] // Used on Linux when gvproxy runs in qemu/unixstream mode.
@@ -110,7 +136,11 @@ pub fn required_runtime_lib_name() -> &'static str {
     {
         "libkrun.dylib"
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        "libkrun.dll"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         "libkrun.so"
     }
@@ -132,6 +162,7 @@ impl LibKrun {
             krun_free_ctx: load_symbol(library, b"krun_free_ctx\0", &libkrun_path)?,
             krun_set_vm_config: load_symbol(library, b"krun_set_vm_config\0", &libkrun_path)?,
             krun_add_disk: load_symbol(library, b"krun_add_disk\0", &libkrun_path)?,
+            krun_add_disk2: load_symbol(library, b"krun_add_disk2\0", &libkrun_path)?,
             krun_set_root_disk_remount: load_symbol(
                 library,
                 b"krun_set_root_disk_remount\0",
@@ -139,18 +170,21 @@ impl LibKrun {
             )?,
             krun_set_workdir: load_symbol(library, b"krun_set_workdir\0", &libkrun_path)?,
             krun_set_exec: load_symbol(library, b"krun_set_exec\0", &libkrun_path)?,
+            #[cfg(unix)]
             krun_set_console_output: load_symbol(
                 library,
                 b"krun_set_console_output\0",
                 &libkrun_path,
             )?,
             krun_start_enter: load_symbol(library, b"krun_start_enter\0", &libkrun_path)?,
+            #[cfg(unix)]
             krun_disable_implicit_vsock: load_symbol(
                 library,
                 b"krun_disable_implicit_vsock\0",
                 &libkrun_path,
             )?,
             krun_add_vsock: load_symbol(library, b"krun_add_vsock\0", &libkrun_path)?,
+            krun_add_virtiofs: load_symbol(library, b"krun_add_virtiofs\0", &libkrun_path)?,
             #[cfg(target_os = "macos")]
             krun_add_net_unixgram: load_symbol(library, b"krun_add_net_unixgram\0", &libkrun_path)?,
             krun_add_net_unixstream: load_symbol(
@@ -180,7 +214,11 @@ fn preload_runtime_support_libraries(runtime_dir: &Path) -> Result<Vec<PathBuf>,
                                 .extension()
                                 .is_some_and(|ext| ext.eq_ignore_ascii_case("dylib"))
                     }
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(target_os = "windows")]
+                    {
+                        name.starts_with("libkrunfw") && name.contains(".dll")
+                    }
+                    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                     {
                         name.starts_with("libkrunfw") && name.contains(".so")
                     }
@@ -190,24 +228,48 @@ fn preload_runtime_support_libraries(runtime_dir: &Path) -> Result<Vec<PathBuf>,
 
     support_libs.sort();
     for path in &support_libs {
-        let path_cstr = CString::new(path.to_string_lossy().as_bytes())
-            .map_err(|e| format!("invalid support library path {}: {e}", path.display()))?;
-        let handle =
-            unsafe { libc::dlopen(path_cstr.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
-        if handle.is_null() {
-            let error = unsafe {
-                let err = libc::dlerror();
-                if err.is_null() {
-                    "unknown dlopen error".to_string()
-                } else {
-                    CStr::from_ptr(err).to_string_lossy().into_owned()
-                }
-            };
-            return Err(format!(
-                "preload runtime support library {}: {error}",
-                path.display()
-            ));
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
+            use windows_sys::Win32::Foundation::GetLastError;
+
+            // Convert path to a null-terminated UTF-16 string for Windows APIs
+            let mut wide_path: Vec<u16> = path.as_os_str().encode_wide().collect();
+            wide_path.push(0);
+
+            let handle = unsafe { LoadLibraryW(wide_path.as_ptr()) };
+            if handle.is_null() {
+                let error_code = unsafe { GetLastError() };
+                return Err(format!(
+                    "preload runtime support library {}: GetLastError() returned {}",
+                    path.display(),
+                    error_code
+                ));
+            }
         }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let path_cstr = CString::new(path.to_string_lossy().as_bytes())
+            .map_err(|e| format!("invalid support library path {}: {e}", path.display()))?;
+            let handle =
+                unsafe { libc::dlopen(path_cstr.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+            if handle.is_null() {
+                let error = unsafe {
+                    let err = libc::dlerror();
+                    if err.is_null() {
+                        "unknown dlopen error".to_string()
+                    } else {
+                        CStr::from_ptr(err).to_string_lossy().into_owned()
+                    }
+                };
+                return Err(format!(
+                    "preload runtime support library {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+        
     }
 
     Ok(support_libs)

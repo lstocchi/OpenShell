@@ -7,8 +7,11 @@ pub mod driver_config;
 pub mod lease;
 pub mod vm;
 
+#[cfg(unix)]
 pub use openshell_driver_docker::DockerComputeConfig;
+#[cfg(unix)]
 pub use openshell_driver_kubernetes::KubernetesComputeConfig;
+#[cfg(unix)]
 pub use openshell_driver_podman::PodmanComputeConfig;
 pub use vm::VmComputeConfig;
 
@@ -34,10 +37,13 @@ use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
     SandboxTemplate, SshSession,
 };
+#[cfg(unix)]
 use openshell_driver_docker::DockerComputeDriver;
+#[cfg(unix)]
 use openshell_driver_kubernetes::{
     ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
 };
+#[cfg(unix)]
 use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 use prost::Message;
 use std::fmt;
@@ -66,6 +72,7 @@ trait ShutdownCleanup: Send + Sync {
 }
 
 #[tonic::async_trait]
+#[cfg(unix)]
 impl ShutdownCleanup for DockerComputeDriver {
     async fn cleanup_on_shutdown(&self) -> Result<(), String> {
         let stopped = self
@@ -91,6 +98,7 @@ trait StartupResume: Send + Sync {
 }
 
 #[tonic::async_trait]
+#[cfg(unix)]
 impl StartupResume for DockerComputeDriver {
     async fn resume_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<bool, String> {
         Self::resume_sandbox(self, sandbox_id, sandbox_name)
@@ -336,6 +344,7 @@ impl ComputeRuntime {
         self.sync_lock.clone().lock_owned().await
     }
 
+    #[cfg(unix)]
     pub async fn new_docker(
         config: openshell_core::Config,
         docker_config: DockerComputeConfig,
@@ -370,6 +379,7 @@ impl ComputeRuntime {
         .await
     }
 
+    #[cfg(unix)]
     pub async fn new_kubernetes(
         config: KubernetesComputeConfig,
         store: Arc<Store>,
@@ -423,6 +433,7 @@ impl ComputeRuntime {
         .await
     }
 
+    #[cfg(unix)]
     pub async fn new_podman(
         config: PodmanComputeConfig,
         store: Arc<Store>,

@@ -1454,9 +1454,14 @@ fn openshell_ssh_config_path() -> Result<PathBuf> {
 }
 
 fn user_ssh_config_path() -> Result<PathBuf> {
+    #[cfg(unix)]
     let home = std::env::var("HOME")
         .into_diagnostic()
         .wrap_err("HOME is not set")?;
+    #[cfg(windows)]
+    let home = std::env::var("USERPROFILE")
+        .into_diagnostic()
+        .wrap_err("USERPROFILE is not set")?;
     Ok(PathBuf::from(home).join(".ssh").join("config"))
 }
 

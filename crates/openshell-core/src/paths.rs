@@ -20,9 +20,14 @@ pub fn xdg_config_dir() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("XDG_CONFIG_HOME") {
         return Ok(PathBuf::from(path));
     }
+    #[cfg(unix)]
     let home = std::env::var("HOME")
         .into_diagnostic()
         .wrap_err("HOME is not set")?;
+    #[cfg(windows)]
+    let home = std::env::var("USERPROFILE")
+        .into_diagnostic()
+        .wrap_err("USERPROFILE is not set")?;
     Ok(PathBuf::from(home).join(".config"))
 }
 
@@ -38,9 +43,14 @@ pub fn xdg_state_dir() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("XDG_STATE_HOME") {
         return Ok(PathBuf::from(path));
     }
+    #[cfg(unix)]
     let home = std::env::var("HOME")
         .into_diagnostic()
         .wrap_err("HOME is not set")?;
+    #[cfg(windows)]
+    let home = std::env::var("USERPROFILE")
+        .into_diagnostic()
+        .wrap_err("USERPROFILE is not set")?;
     Ok(PathBuf::from(home).join(".local").join("state"))
 }
 
@@ -56,9 +66,14 @@ pub fn xdg_data_dir() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("XDG_DATA_HOME") {
         return Ok(PathBuf::from(path));
     }
+    #[cfg(unix)]
     let home = std::env::var("HOME")
         .into_diagnostic()
         .wrap_err("HOME is not set")?;
+    #[cfg(windows)]
+    let home = std::env::var("USERPROFILE")
+        .into_diagnostic()
+        .wrap_err("USERPROFILE is not set")?;
     Ok(PathBuf::from(home).join(".local").join("share"))
 }
 

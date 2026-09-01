@@ -196,3 +196,53 @@ where
         .map(|_| ())
         .map_err(|e| format!("failed to spawn procguard thread: {e}"))
 }
+fn install_windows_object_watcher<F>(cleanup: F) -> Result<(), String>
+where
+    F: FnOnce() + Send + 'static,
+{
+
+    use windows_sys::Win32::System::Threading::{OpenProcess, RegisterWaitForSingleObject, TerminateProcess, INFINITE, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, WT_EXECUTEONLYONCE};
+    use windows_sys::Win32::Foundation::CloseHandle;
+
+    let ppid_str = std::env::var("OPENSHELL_KRUN_WORKER_PID").unwrap_or_default();
+    let ppid: u32 = ppid_str.parse().unwrap_or(0);
+
+    if ppid == 0 {
+        return Ok(());
+    }
+
+    let parent_handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, ppid) };
+    if parent_handle.is_null() {
+        // The parent is already dead before we could open a handle to it.
+        return Err("process was already orphaned before procguard armed".to_string());
+    }
+
+    let mut wait_handle = std::ptr::null_mut();
+    let context = Box::into_raw(Box::new(cleanup)) as *const core::ffi::c_void;
+    let res = unsafe { RegisterWaitForSingleObject(
+        &mut wait_handle,
+        parent_handle,
+        Some(parent_exit_callback),
+        context,
+        INFINITE,
+        WT_EXECUTEONLYONCE,
+    ) };
+
+    if res == 0 {
+        unsafe { CloseHandle(parent_handle) };
+        return Err("RegisterWaitForSingleObject failed".to_string());
+    }
+
+    Ok(())
+
+}
+
+unsafe extern "system" fn parent_exit_callback(context: *mut core::ffi::c_void, _timer_fired: bool) {
+    let cleanup_ptr = context as usize;
+    if cleanup_ptr != 0 {
+        // Reconstitute the Rust function pointer and call it
+        let cleanup: fn() = unsafe { std::mem::transmute(cleanup_ptr) };
+        cleanup();
+    }
+    std::process::exit(1);
+}

@@ -23,14 +23,12 @@ openshell-core = { path = "../openshell-core", default-features = false }
 openshell-policy = { path = "../openshell-policy" }
 openshell-vfio = { path = "../openshell-vfio" }
 
-bollard = { version = "0.20", features = ["ssh"] }
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }
 prost = { workspace = true }
 prost-types = { workspace = true }
 futures = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
-nix = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -64,6 +62,14 @@ temp-env = "0.3"
 # syscall with no helper thread.
 [target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
 polling = "3.11"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_LibraryLoader", "Win32_Foundation", "Win32_System_Threading", "Win32_System_Pipes", "Win32_System_IO", "Win32_System_Ioctl" ] }
+bollard = { version = "0.20" }
+
+[target.'cfg(not(windows))'.dependencies]
+nix = { workspace = true }
+bollard = { version = "0.20", features = ["ssh"] }
 
 [lints]
 workspace = true

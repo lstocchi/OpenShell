@@ -20,8 +20,11 @@ use bollard::models::ContainerCreateBody;
 use bollard::query_parameters::{CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder};
 use flate2::read::GzDecoder;
 use futures::{Stream, StreamExt, TryStreamExt};
+#[cfg(not(target_os = "windows"))]
 use nix::errno::Errno;
+#[cfg(not(target_os = "windows"))]
 use nix::sys::signal::{Signal, kill};
+#[cfg(not(target_os = "windows"))]
 use nix::unistd::Pid;
 use oci_client::client::{Client as OciClient, ClientConfig};
 use oci_client::manifest::{
@@ -517,6 +520,8 @@ impl VmDriver {
             sandbox_name = %sandbox.name,
             "vm driver: create_sandbox received"
         );
+
+        info !("sandbox: {:#?}", sandbox);
         validate_vm_sandbox(sandbox, self.config.gpu_enabled)?;
 
         let state_dir = sandbox_state_dir(&self.config.state_dir, &sandbox.id)?;
@@ -1690,6 +1695,7 @@ impl VmDriver {
         sandbox_id: &str,
         image_ref: &str,
     ) -> Result<RuntimeImagePlan, Status> {
+        info!("vm driver: preparing runtime images {}", image_ref);
         let bootstrap_image_ref = self.bootstrap_image_ref(image_ref);
         let bootstrap_image_identity = self
             .ensure_cached_bootstrap_rootfs_image(sandbox_id, &bootstrap_image_ref)
@@ -1705,6 +1711,8 @@ impl VmDriver {
             });
         }
 
+        info!("vm driver: preparing image disk");
+
         let prepared = self
             .ensure_prepared_image_disk(sandbox_id, image_ref, &root_disk)
             .await?;
@@ -1717,6 +1725,7 @@ impl VmDriver {
     }
 
     fn bootstrap_image_ref(&self, sandbox_image_ref: &str) -> String {
+        info!("vm driver: bootstrap_image_ref {sandbox_image_ref}, configured: {configured}, default: {default}", configured = self.config.bootstrap_image, default = self.config.default_image);
         let configured = self.config.bootstrap_image.trim();
         if !configured.is_empty() {
             return configured.to_string();
@@ -2114,6 +2123,7 @@ impl VmDriver {
         if let Some((docker, image_identity)) =
             self.resolve_local_container_image(image_ref).await?
         {
+            info!("vm driver: preparing prepared image disk for local image");
             return self
                 .ensure_prepared_local_image_disk(
                     sandbox_id,
@@ -2125,6 +2135,7 @@ impl VmDriver {
                 .await;
         }
 
+        info!("vm driver: preparing prepared image disk for registry image");
         self.ensure_prepared_registry_image_disk(sandbox_id, image_ref, bootstrap_root_disk)
             .await
     }
@@ -2207,6 +2218,7 @@ impl VmDriver {
         image_ref: &str,
         bootstrap_root_disk: &Path,
     ) -> Result<PreparedImageDisk, Status> {
+        info!("vm driver: preparing prepared image disk for registry image {bootstrap_root_disk:?}");
         let reference = parse_registry_reference(image_ref)?;
         let client = registry_client();
         let auth = registry_auth(image_ref)?;
@@ -2378,6 +2390,7 @@ impl VmDriver {
         staging_dir: &Path,
         payload: &GuestImagePayload,
     ) -> Result<(), Status> {
+        info!("vm driver: building prepared image disk for {image_ref} {image_source} {image_identity} {bootstrap_root_disk:?} {staging_dir:?} {payload:?}");
         let cache_dir = image_cache_dir(&self.config.state_dir, image_identity);
         let image_path = image_cache_rootfs_image(&self.config.state_dir, image_identity);
         let prepared_image = staging_dir.join(IMAGE_CACHE_ROOTFS_IMAGE);
@@ -2608,47 +2621,66 @@ impl VmDriver {
                 ("sandbox_uid".to_string(), sandbox_uid.to_string()),
             ]),
         );
-        let prepare_result = tokio::task::spawn_blocking(move || {
-            extract_rootfs_archive_to(&exported_rootfs_for_build, &prepared_rootfs_for_build)?;
-            prepare_sandbox_rootfs_from_image_root(
-                &prepared_rootfs_for_build,
-                &image_identity_owned,
-                sandbox_uid,
-                sandbox_gid,
-            )
-            .map_err(|err| {
-                format!("vm sandbox image '{image_ref_owned}' is not base-compatible: {err}")
+
+        #[cfg(not(target_os = "windows"))] 
+        {
+            let prepare_result = tokio::task::spawn_blocking(move || {
+                extract_rootfs_archive_to(&exported_rootfs_for_build, &prepared_rootfs_for_build)?;
+                prepare_sandbox_rootfs_from_image_root(
+                    &prepared_rootfs_for_build,
+                    &image_identity_owned,
+                    sandbox_uid,
+                    sandbox_gid,
+                )
+                .map_err(|err| {
+                    format!("vm sandbox image '{image_ref_owned}' is not base-compatible: {err}")
+                })
             })
-        })
-        .await
-        .map_err(|err| Status::internal(format!("local image preparation panicked: {err}")))?;
-
-        if let Err(err) = prepare_result {
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-            return Err(Status::failed_precondition(err));
+            .await
+            .map_err(|err| Status::internal(format!("local image preparation panicked: {err}")))?;
+    
+            if let Err(err) = prepare_result {
+                let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                return Err(Status::failed_precondition(err));
+            }
+    
+            self.publish_vm_progress(
+                sandbox_id,
+                "CreatingRootDisk",
+                "Formatting VM root disk image".to_string(),
+                HashMap::from([
+                    ("image_ref".to_string(), image_ref.to_string()),
+                    ("image_source".to_string(), "local_docker".to_string()),
+                    ("image_identity".to_string(), image_identity.to_string()),
+                ]),
+            );
+            let prepared_rootfs_for_build = prepared_rootfs.clone();
+            let prepared_image_for_build = prepared_image.clone();
+            let build_result = tokio::task::spawn_blocking(move || {
+                create_rootfs_image_from_dir(&prepared_rootfs_for_build, &prepared_image_for_build)
+            })
+            .await
+            .map_err(|err| Status::internal(format!("rootfs image build panicked: {err}")))?;
+    
+            if let Err(err) = build_result {
+                let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                return Err(Status::failed_precondition(err));
+            }
         }
+        #[cfg(target_os = "windows")] 
+        {
+            let target_image = prepared_image.clone();
 
-        self.publish_vm_progress(
-            sandbox_id,
-            "CreatingRootDisk",
-            "Formatting VM root disk image".to_string(),
-            HashMap::from([
-                ("image_ref".to_string(), image_ref.to_string()),
-                ("image_source".to_string(), "local_docker".to_string()),
-                ("image_identity".to_string(), image_identity.to_string()),
-            ]),
-        );
-        let prepared_rootfs_for_build = prepared_rootfs.clone();
-        let prepared_image_for_build = prepared_image.clone();
-        let build_result = tokio::task::spawn_blocking(move || {
-            create_rootfs_image_from_dir(&prepared_rootfs_for_build, &prepared_image_for_build)
-        })
-        .await
-        .map_err(|err| Status::internal(format!("rootfs image build panicked: {err}")))?;
+            let build_result = tokio::task::spawn_blocking(move || {
+                crate::e2fs_vm::format_ext4_via_vm(&exported_rootfs_for_build, &target_image)
+            })
+            .await
+            .map_err(|err| Status::internal(format!("rootfs image build panicked: {err}")))?;
 
-        if let Err(err) = build_result {
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-            return Err(Status::failed_precondition(err));
+            if let Err(err) = build_result {
+                let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                return Err(Status::failed_precondition(err));
+            }
         }
 
         if tokio::fs::metadata(&image_path).await.is_ok() {
@@ -2663,6 +2695,70 @@ impl VmDriver {
         Ok(())
     }
 
+    /* #[cfg(target_os = "windows")]
+    async fn build_registry_rootfs_image_via_prep_vm(
+        &self,
+        sandbox_id: &str,
+        client: &OciClient,
+        reference: &Reference,
+        auth: &RegistryAuth,
+        image_ref: &str,
+        image_identity: &str,
+        staging_dir: &Path,
+        image_path: &Path,
+    ) -> Result<(), Status> {
+        client
+            .auth(reference, auth, RegistryOperation::Pull)
+            .await
+            .map_err(|err| {
+                Status::failed_precondition(format!(
+                    "failed to authenticate registry access for vm sandbox image '{image_ref}': {err}"
+                ))
+            })?;
+        //let layout_dir = staging_dir.join(GUEST_IMAGE_OCI_LAYOUT_DIR);
+        let (manifest, _) = client
+            .pull_image_manifest(reference, auth)
+            .await
+            .map_err(|err| Status::failed_precondition(format!("failed to pull manifest: {err}")))?;
+
+        // 1. Download config & layer blobs directly to disk WITHOUT extracting
+        tokio::fs::create_dir_all(oci_layout_blobs_dir(&layout_dir)).await?;
+        
+        download_registry_descriptor_blob_file(
+            client, reference, image_ref, &layout_dir, &manifest.config, "config"
+        ).await?;
+
+        for (index, layer) in manifest.layers.iter().enumerate() {
+            download_registry_descriptor_blob_file(
+                client, reference, image_ref, &layout_dir, layer, &format!("layer {}", index + 1)
+            ).await?;
+        }
+
+        write_oci_layout_for_manifest(&layout_dir, GUEST_IMAGE_OCI_REF, &manifest)
+            .map_err(|err| Status::internal(format!("write OCI layout failed: {err}")))?;
+
+        // 2. Stage payload and unpack inside the Linux Helper VM directly to ext4
+        let payload = GuestImagePayload {
+            image_ref: image_ref.to_string(),
+            image_identity: image_identity.to_string(),
+            source: GuestImagePayloadSource::RegistryOciLayout { layout_dir },
+        };
+
+        // Format raw ext4 disk and unpack via Linux prep VM
+        self.build_prepared_image_disk(
+            sandbox_id,
+            image_ref,
+            "registry",
+            image_identity,
+            image_path, // Target path
+            staging_dir,
+            &payload,
+        )
+        .await?;
+
+        Ok(())
+    } */
+
     #[allow(clippy::similar_names)]
     async fn build_cached_registry_image_rootfs_image(
         &self,
@@ -2676,6 +2772,29 @@ impl VmDriver {
         let cache_dir = image_cache_dir(&self.config.state_dir, image_identity);
         let image_path = image_cache_rootfs_image(&self.config.state_dir, image_identity);
         let staging_dir = image_cache_staging_dir(&self.config.state_dir, image_identity);
+
+        info!(
+            image_ref = %image_ref,
+            image_identity = %image_identity,
+            staging_dir = %staging_dir.display(),
+            image_path = %image_path.display(),
+            cache_dir = %cache_dir.display(),
+            "vm driver: building cached registry image rootfs image", 
+        );
+
+        /*
+        image_ref=ghcr.io/nvidia/openshell-community/sandboxes/base:latest 
+        image_identity=sandbox-bootstrap-rootfs-ext4-v3:openshell-0.0.77-dev.2+g6252aa17:
+                    sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e 
+        staging_dir=C:\Users\baldr\.local\state\openshell\vm-driver\images\sandbox-bootstrap-rootfs-ext4-v3-openshell-
+                    0.0.77-dev.2-g6252aa17-sha256-aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e
+                    .staging-1786523941577-0 
+        image_path=C:\Users\baldr\.local\state\openshell\vm-driver\images\sandbox-bootstrap-rootfs-ext4-v3-openshell-0.0.77-dev.
+                    2-g6252aa17-sha256-aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e\rootfs.ext4 
+        cache_dir=C:\Users\baldr\.local\state\openshell\vm-driver\images\sandbox-bootstrap-rootfs-ext4-v3-openshell-0.0.77-dev.
+                    2-g6252aa17-sha256-aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e
+         */
+
         let prepared_rootfs = staging_dir.join("rootfs");
         let prepared_image = staging_dir.join(IMAGE_CACHE_ROOTFS_IMAGE);
 
@@ -2706,6 +2825,28 @@ impl VmDriver {
             staging_dir = %staging_dir.display(),
             "vm driver: pulling registry image layers"
         );
+
+        // -------------------------------------------------------------------
+        // WINDOWS PATH: Do NOT unpack layer tarballs on host NTFS!
+        // -------------------------------------------------------------------
+/*         #[cfg(target_os = "windows")]
+        {
+            // On Windows, route registry base image preparation through the 
+            // OCI Layout + prep-VM pipeline so umoci unpacks layers inside Linux.
+            return self
+                .build_registry_rootfs_image_via_prep_vm(
+                    sandbox_id,
+                    client,
+                    reference,
+                    auth,
+                    image_ref,
+                    image_identity,
+                    &staging_dir,
+                    &image_path,
+                )
+                .await;
+        } */
+        
         if let Err(err) = self
             .pull_registry_image_rootfs(
                 sandbox_id,
@@ -2731,6 +2872,10 @@ impl VmDriver {
             "vm driver: image layers pulled, preparing rootfs image"
         );
 
+        info!("STOPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP");
+        info!("STOPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP");
+        info!("STOPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP");
+
         let image_ref_owned = image_ref.to_string();
         let image_identity_owned = image_identity.to_string();
         let prepared_rootfs_for_build = prepared_rootfs.clone();
@@ -2747,6 +2892,8 @@ impl VmDriver {
                 ("sandbox_uid".to_string(), sandbox_uid.to_string()),
             ]),
         );
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
         let prepare_result = tokio::task::spawn_blocking(move || {
             prepare_sandbox_rootfs_from_image_root(
                 &prepared_rootfs_for_build,
@@ -3258,6 +3405,16 @@ fn parse_registry_reference(image_ref: &str) -> Result<Reference, Status> {
     })
 }
 
+#[cfg(unix)]
+fn connect_to_docker_socket(path: &str) -> Result<bollard::Docker, bollard::errors::Error> {
+    bollard::Docker::connect_with_unix(path, 120, bollard::API_DEFAULT_VERSION)
+}
+
+#[cfg(windows)]
+fn connect_to_docker_socket(path: &str) -> Result<bollard::Docker, bollard::errors::Error> {
+    bollard::Docker::connect_with_named_pipe(path, 120, bollard::API_DEFAULT_VERSION)
+}
+
 /// Try to connect to a local container engine (Docker or Podman).
 ///
 /// Tries Docker first (`connect_with_local_defaults`, which respects
@@ -3272,8 +3429,7 @@ async fn connect_local_container_engine() -> Option<Docker> {
 
     let podman_socket = podman_socket_path();
     if podman_socket.exists()
-        && let Ok(docker) =
-            Docker::connect_with_unix(podman_socket.to_str()?, 120, bollard::API_DEFAULT_VERSION)
+        && let Ok(docker) = connect_to_docker_socket(podman_socket.to_str()?)
         && docker.ping().await.is_ok()
     {
         info!(
@@ -3302,6 +3458,10 @@ fn podman_socket_path() -> PathBuf {
             },
             |xdg| PathBuf::from(xdg).join("podman/podman.sock"),
         )
+    }
+    #[cfg(target_os = "windows")]
+    {
+        PathBuf::from("//./pipe/podman-machine-default")
     }
 }
 
@@ -3420,6 +3580,7 @@ fn registry_client() -> OciClient {
 }
 
 fn linux_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
+    info!("linux_platform_resolver: {:#?}", manifests);
     let expected_arch = linux_oci_arch();
     manifests
         .iter()
@@ -3554,6 +3715,7 @@ impl VmDriver {
             .await?;
         layers.sort_by_key(|layer| layer.index);
 
+        #[cfg(unix)]
         for layer in &layers {
             apply_registry_layer_blob(image_ref, rootfs, layer).await?;
         }
@@ -3666,20 +3828,23 @@ async fn download_registry_layer_blob(
         ))
     })?;
 
-    let blob_path_for_unpack = blob_path.clone();
-    let layer_root_for_unpack = layer_root.clone();
-    let media_type = layer.media_type.clone();
-    tokio::task::spawn_blocking(move || {
-        extract_layer_blob_to_dir(&blob_path_for_unpack, &media_type, &layer_root_for_unpack)
-    })
-    .await
-    .map_err(|err| Status::internal(format!("layer extraction panicked: {err}")))?
-    .map_err(|err| {
-        Status::failed_precondition(format!(
-            "failed to extract layer '{}' for vm sandbox image '{image_ref}': {err}",
-            layer.digest
-        ))
-    })?;
+    #[cfg(unix)]
+    {
+        let blob_path_for_unpack = blob_path.clone();
+        let layer_root_for_unpack = layer_root.clone();
+        let media_type = layer.media_type.clone();
+        tokio::task::spawn_blocking(move || {
+            extract_layer_blob_to_dir(&blob_path_for_unpack, &media_type, &layer_root_for_unpack)
+        })
+        .await
+        .map_err(|err| Status::internal(format!("layer extraction panicked: {err}")))?
+        .map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to extract layer '{}' for vm sandbox image '{image_ref}': {err}",
+                layer.digest
+            ))
+        })?;
+    }    
 
     Ok(DownloadedRegistryLayer {
         index,
@@ -3976,9 +4141,68 @@ fn copy_symlink(source_path: &Path, dest_path: &Path) -> Result<(), String> {
     })
 }
 
-#[cfg(not(unix))]
-fn copy_symlink(_source_path: &Path, _dest_path: &Path) -> Result<(), String> {
-    Err("symlink layers are only supported on Unix hosts".to_string())
+#[cfg(windows)]
+fn copy_symlink(source_path: &Path, dest_path: &Path) -> Result<(), String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::Foundation::HANDLE;
+
+    let target = fs::read_link(source_path)
+        .map_err(|err| format!("readlink {}: {err}", source_path.display()))?;
+
+    remove_path_if_exists(dest_path)?;
+
+    if let Some(parent) = dest_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
+    }
+
+    // 1. Create an empty file to hold the reparse point
+    // FILE_FLAG_BACKUP_SEMANTICS (0x02000000) | FILE_FLAG_OPEN_REPARSE_POINT (0x00200000)
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(0x02200000)
+        .open(dest_path)
+        .map_err(|err| format!("create reparse file {}: {err}", dest_path.display()))?;
+
+    // 2. Build the LX_SYMLINK reparse data buffer
+    // Layout: Tag (u32), Length (u16), Reserved (u16), PathBuffer ([]u8)
+    let target_bytes = target.to_string_lossy().into_owned().into_bytes();
+    let data_length = target_bytes.len() as u16;
+    
+    let mut buffer = Vec::with_capacity(8 + target_bytes.len());
+    buffer.extend_from_slice(&0xA000001D_u32.to_le_bytes()); // ReparseTag: IO_REPARSE_TAG_LX_SYMLINK
+    buffer.extend_from_slice(&data_length.to_le_bytes());    // ReparseDataLength
+    buffer.extend_from_slice(&0_u16.to_le_bytes());           // Reserved
+    buffer.extend_from_slice(&target_bytes);                  // PathBuffer
+
+    let mut bytes_returned = 0;
+    let handle = file.as_raw_handle() as HANDLE;
+
+    // 3. Invoke DeviceIoControl to attach the buffer
+    let result = unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_SET_REPARSE_POINT,
+            buffer.as_ptr() as *const _,
+            buffer.len() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if result == 0 {
+        let os_err = std::io::Error::last_os_error();
+        drop(file);
+        let _ = fs::remove_file(dest_path);
+        return Err(format!("DeviceIoControl failed for LX_SYMLINK {}: {}", dest_path.display(), os_err));
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4957,6 +5181,7 @@ fn overlay_staging_dir(overlay_disk: &Path) -> PathBuf {
     ))
 }
 
+#[cfg(not(target_os = "windows"))]
 async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
     if let Some(pid) = child.id()
         && let Err(err) = kill(Pid::from_raw(pid.cast_signed()), Signal::SIGTERM)
@@ -4975,6 +5200,13 @@ async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
             child.wait().await.map(|_| ())
         }
     }
+}
+
+#[cfg(windows)]
+async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
+    // Windows does not support standard POSIX signaling; gracefully kill the task direct
+    child.kill().await?;
+    child.wait().await.map(|_| ())
 }
 
 fn sandbox_snapshot(sandbox: &Sandbox, condition: SandboxCondition, deleting: bool) -> Sandbox {

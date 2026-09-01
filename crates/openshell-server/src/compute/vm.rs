@@ -5,13 +5,14 @@
 //!
 //! This module owns everything needed to hand the gateway a `Channel` speaking
 //! the `openshell.compute.v1.ComputeDriver` RPC surface against an
-//! `openshell-driver-vm` subprocess over a Unix domain socket:
+//! `openshell-driver-vm` subprocess over a local IPC transport: a Unix
+//! domain socket on Unix, or a named pipe on Windows.
 //!
 //! - [`VmComputeConfig`]: gateway-local configuration (state dir, driver binary,
 //!   VM shape, guest TLS material).
-//! - [`spawn`]: spawn the driver subprocess, wait for its UDS to be ready,
-//!   and return a live gRPC channel plus a [`ManagedDriverProcess`] handle
-//!   that will reap the subprocess and clean up the socket on drop.
+//! - [`spawn`]: spawn the driver subprocess, wait for its IPC endpoint to be
+//!   ready, and return a live gRPC channel plus a [`ManagedDriverProcess`]
+//!   handle that will reap the subprocess and clean up the socket on drop.
 //! - Helpers to resolve the driver binary, compute the socket path, and
 //!   validate guest TLS material when the gateway runs an `https://` control
 //!   plane.
@@ -30,33 +31,28 @@
 //! interface.
 
 use super::AcquiredRemoteDriverEndpoint;
-#[cfg(unix)]
 use super::ManagedDriverProcess;
-#[cfg(unix)]
 use hyper_util::rt::TokioIo;
-#[cfg(unix)]
 use openshell_core::proto::compute::v1::{
     GetCapabilitiesRequest, compute_driver_client::ComputeDriverClient,
 };
 use openshell_core::{ComputeDriverKind, Config, Error, Result};
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-#[cfg(unix)]
 use std::path::Path;
 use std::path::PathBuf;
-#[cfg(unix)]
 use std::{io::ErrorKind, process::Stdio, sync::Arc, time::Duration};
 #[cfg(unix)]
 use tokio::net::UnixStream;
-#[cfg(unix)]
 use tokio::process::Command;
 use tonic::transport::Channel;
-#[cfg(unix)]
 use tonic::transport::Endpoint;
-#[cfg(unix)]
 use tower::service_fn;
 
+#[cfg(unix)]
 const DRIVER_BIN_NAME: &str = "openshell-driver-vm";
+#[cfg(windows)]
+const DRIVER_BIN_NAME: &str = "openshell-driver-vm.exe";
 const COMPUTE_DRIVER_SOCKET_RUN_DIR: &str = "run";
 const COMPUTE_DRIVER_SOCKET_NAME: &str = "compute-driver.sock";
 
@@ -136,7 +132,8 @@ impl VmComputeConfig {
         4096
     }
 
-    #[must_use]
+    #[cfg(unix)]
+    #[must_use]    
     fn default_driver_search_dirs(home: Option<PathBuf>) -> Vec<PathBuf> {
         let mut dirs = Vec::new();
         if let Some(home) = home {
@@ -145,6 +142,26 @@ impl VmComputeConfig {
         push_unique_path(&mut dirs, PathBuf::from("/usr/libexec/openshell"));
         push_unique_path(&mut dirs, PathBuf::from("/usr/local/libexec/openshell"));
         push_unique_path(&mut dirs, PathBuf::from("/usr/local/libexec"));
+        dirs
+    }
+
+    #[cfg(windows)]
+    #[must_use]
+    fn default_driver_search_dirs(home: Option<PathBuf>) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+
+        // Check %LOCALAPPDATA%\OpenShell\bin or %LOCALAPPDATA%\programs\openshell
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+            push_unique_path(&mut dirs, local_app_data.join("OpenShell").join("bin"));
+            push_unique_path(&mut dirs, local_app_data.join("programs").join("openshell"));
+        }
+
+        // Check %USERPROFILE%\.openshell\bin as user-level fallback
+        if let Some(profile) = home {
+            push_unique_path(&mut dirs, profile.join(".openshell").join("bin"));
+            push_unique_path(&mut dirs, profile.join(".local").join("bin"));
+        }
+
         dirs
     }
 }
@@ -168,7 +185,6 @@ impl Default for VmComputeConfig {
     }
 }
 
-#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmGuestTlsPaths {
     pub ca: PathBuf,
@@ -182,8 +198,13 @@ pub struct VmGuestTlsPaths {
 /// 1. `{driver_dir}/openshell-driver-vm`, where `driver_dir` comes from
 ///    `[openshell.drivers.vm].driver_dir`.
 /// 2. Conventional install directories:
-///    `~/.local/libexec/openshell`, `/usr/libexec/openshell`,
-///    `/usr/local/libexec/openshell`, `/usr/local/libexec`.
+///    - **Unix**: Relative prefix paths (`{prefix}/libexec`, `{prefix}/libexec/openshell`),
+///      user-local paths (`~/.local/libexec/openshell`), and system directories
+///      (`/usr/libexec/openshell`, `/usr/local/libexec/openshell`, `/usr/local/libexec`).
+///    - **Windows**: Executable-adjacent directories (`{exe_dir}`, `{exe_dir}/drivers`,
+///      `{exe_dir}/bin`), AppData paths (`%LOCALAPPDATA%\OpenShell\bin`,
+///      `%LOCALAPPDATA%\programs\openshell`), and user profile directories
+///      (`%USERPROFILE%\.openshell\bin`, `%USERPROFILE%\.local\bin`).
 /// 3. Sibling of the gateway's own executable (last-resort fallback so
 ///    local development builds still work out of the box).
 pub fn resolve_compute_driver_bin(vm_config: &VmComputeConfig) -> Result<PathBuf> {
@@ -224,6 +245,7 @@ pub fn resolve_compute_driver_bin(vm_config: &VmComputeConfig) -> Result<PathBuf
     )))
 }
 
+#[cfg(unix)]
 fn resolve_driver_search_dirs(vm_config: &VmComputeConfig) -> Vec<PathBuf> {
     vm_config.driver_dir.clone().map_or_else(
         || {
@@ -245,6 +267,32 @@ fn resolve_driver_search_dirs(vm_config: &VmComputeConfig) -> Vec<PathBuf> {
     )
 }
 
+#[cfg(windows)]
+fn resolve_driver_search_dirs(vm_config: &VmComputeConfig) -> Vec<PathBuf> {
+    vm_config.driver_dir.clone().map_or_else(
+        || {
+            let mut dirs = Vec::new();
+
+            if let Ok(current_exe) = std::env::current_exe() {
+                if let Some(exe_dir) = current_exe.parent() {
+                    // Local "bin" subfolder alongside executable
+                    push_unique_path(&mut dirs, exe_dir.join("bin"));
+                }
+            }
+
+            let home_dir = std::env::var_os("USERPROFILE")
+                    .map(PathBuf::from);
+
+            for dir in VmComputeConfig::default_driver_search_dirs(home_dir) {
+                push_unique_path(&mut dirs, dir);
+            }
+
+            dirs
+        },
+        |dir| vec![dir],
+    )
+}
+
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if !paths.iter().any(|existing| existing == &path) {
         paths.push(path);
@@ -252,11 +300,34 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 }
 
 /// Path of the Unix domain socket the driver will listen on.
+#[cfg(unix)]
 pub fn compute_driver_socket_path(vm_config: &VmComputeConfig) -> PathBuf {
     vm_config
         .state_dir
         .join(COMPUTE_DRIVER_SOCKET_RUN_DIR)
         .join(COMPUTE_DRIVER_SOCKET_NAME)
+}
+
+/// Named pipe address the driver will listen on, of the form
+/// `\\.\pipe\openshell-driver-vm-<hash>`.
+///
+/// Unlike the Unix socket path, this has no filesystem footprint — it's
+/// purely a kernel object namespace name — but callers (`spawn`,
+/// `ManagedDriverProcess`) treat it identically to the Unix socket path,
+/// so it's still returned as a `PathBuf`. The hash is derived from
+/// `state_dir` so distinct gateway state directories (e.g. multiple
+/// gateways on one host) don't collide on the same pipe name, while
+/// repeated launches against the same state dir reuse a stable name.
+#[cfg(windows)]
+pub fn compute_driver_socket_path(vm_config: &VmComputeConfig) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    vm_config.state_dir.hash(&mut hasher);
+    PathBuf::from(format!(
+        r"\\.\pipe\openshell-driver-vm-{:016x}",
+        hasher.finish()
+    ))
 }
 
 #[cfg(unix)]
@@ -274,6 +345,17 @@ fn prepare_compute_driver_socket_path(
     })?;
     prepare_private_socket_dir(parent, expected_uid)?;
     remove_stale_socket(socket_path, expected_uid)
+}
+
+/// Named pipes are kernel objects with no filesystem footprint, so unlike
+/// the Unix path there's no socket directory or stale-socket cleanup to
+/// perform here — only the driver's on-disk state dir needs preparing.
+#[cfg(windows)]
+fn prepare_compute_driver_socket_path(
+    vm_config: &VmComputeConfig,
+    _socket_path: &Path,
+) -> Result<()> {
+    prepare_vm_state_dir(&vm_config.state_dir)
 }
 
 #[cfg(unix)]
@@ -301,6 +383,18 @@ fn prepare_vm_state_dir(state_dir: &Path, expected_uid: u32) -> Result<()> {
             },
         )?;
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn prepare_vm_state_dir(state_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(state_dir).map_err(|err| {
+        Error::execution(format!(
+            "failed to create vm driver state dir '{}': {err}",
+            state_dir.display()
+        ))
+    })?;
+    let _ = checked_directory_metadata(state_dir, "vm driver state dir")?;
     Ok(())
 }
 
@@ -357,6 +451,40 @@ fn checked_directory_metadata(
     Ok(metadata)
 }
 
+#[cfg(windows)]
+fn checked_directory_metadata(
+    path: &Path,
+    label: &str,
+) -> Result<std::fs::Metadata> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|err| {
+        Error::execution(format!(
+            "failed to stat {label} '{}': {err}",
+            path.display()
+        ))
+    })?;
+
+    let file_type = metadata.file_type();
+
+    // On Windows, metadata.file_type().is_symlink() checks both 
+    // symbolic links and NTFS junction points.
+    if file_type.is_symlink() {
+        return Err(Error::execution(format!(
+            "{label} '{}' is a symlink or junction point; refusing to use it",
+            path.display()
+        )));
+    }
+
+    // Directory check
+    if !file_type.is_dir() {
+        return Err(Error::execution(format!(
+            "{label} '{}' is not a directory",
+            path.display()
+        )));
+    }
+
+    Ok(metadata)
+}
+
 #[cfg(unix)]
 fn remove_stale_socket(socket_path: &Path, expected_uid: u32) -> Result<()> {
     let metadata = match std::fs::symlink_metadata(socket_path) {
@@ -398,7 +526,6 @@ fn remove_stale_socket(socket_path: &Path, expected_uid: u32) -> Result<()> {
     })
 }
 
-#[cfg(unix)]
 pub fn compute_driver_guest_tls_paths(
     vm_config: &VmComputeConfig,
 ) -> Result<Option<VmGuestTlsPaths>> {
@@ -448,7 +575,6 @@ pub fn compute_driver_guest_tls_paths(
 /// Launch the VM compute-driver subprocess, wait for its UDS to come up,
 /// and return a gRPC `Channel` connected to it plus a process handle that
 /// kills the subprocess and removes the socket on drop.
-#[cfg(unix)]
 pub async fn spawn(
     config: &Config,
     vm_config: &VmComputeConfig,
@@ -515,7 +641,7 @@ pub async fn spawn(
     ))
 }
 
-#[cfg(not(unix))]
+/* #[cfg(not(unix))]
 pub async fn spawn(
     _config: &Config,
     _vm_config: &VmComputeConfig,
@@ -523,9 +649,8 @@ pub async fn spawn(
     Err(Error::config(
         "the vm compute driver requires unix domain socket support",
     ))
-}
+} */
 
-#[cfg(unix)]
 async fn wait_for_compute_driver(
     socket_path: &Path,
     child: &mut tokio::process::Child,
@@ -565,14 +690,30 @@ async fn wait_for_compute_driver(
     )))
 }
 
-#[cfg(unix)]
 async fn connect_compute_driver(socket_path: &Path) -> Result<Channel> {
     let socket_path = socket_path.to_path_buf();
     let display_path = socket_path.clone();
     Endpoint::from_static("http://[::]:50051")
         .connect_with_connector(service_fn(move |_: tonic::transport::Uri| {
             let socket_path = socket_path.clone();
-            async move { UnixStream::connect(socket_path).await.map(TokioIo::new) }
+            async move {
+                #[cfg(unix)]
+                {
+                    UnixStream::connect(socket_path).await.map(TokioIo::new)
+                }
+                #[cfg(windows)]
+                {
+                    // `socket_path` is actually a named pipe address of the
+                    // form `\\.\pipe\...` on Windows (see
+                    // `compute_driver_socket_path`) — this is purely
+                    // host-local IPC between the gateway and its driver
+                    // subprocess, unrelated to the VMM's own networking.
+                    use tokio::net::windows::named_pipe::ClientOptions;
+
+                    let pipe_name = socket_path.to_string_lossy().into_owned();
+                    ClientOptions::new().open(&pipe_name).map(TokioIo::new)
+                }
+            }
         }))
         .await
         .map_err(|e| {

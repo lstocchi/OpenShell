@@ -40,6 +40,8 @@ test-helpers = []
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
+
+[target.'cfg(not(windows))'.build-dependencies]
 protobuf-src = { workspace = true }
 
 [dev-dependencies]

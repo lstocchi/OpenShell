@@ -9,13 +9,19 @@ use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServ
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
 use openshell_driver_vm::{VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, procguard, run_vm};
+#[cfg(windows)]
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+#[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -161,10 +167,27 @@ struct Args {
 
     #[arg(long, hide = true)]
     vm_gateway_port: Option<u16>,
+
+    // -- e2fs helper VM args (Windows only, used by --internal-e2fs-helper) --
+    #[arg(long, hide = true, default_value_t = false)]
+    internal_e2fs_helper: bool,
+
+    #[arg(long = "e2fs-runtime-dir", hide = true)]
+    e2fs_runtime_dir: Option<PathBuf>,
+
+    #[arg(long = "e2fs-helper-rootfs", hide = true)]
+    e2fs_helper_rootfs: Option<PathBuf>,
+
+    #[arg(long = "e2fs-data-disk", hide = true)]
+    e2fs_data_disk: Option<PathBuf>,
+
+    #[arg(long = "e2fs-args", hide = true, allow_hyphen_values = true)]
+    e2fs_args: Vec<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing::info!("Starting openshell-driver-vm");
     let args = Args::parse();
     if args.internal_run_vm {
         // We intentionally defer procguard arming until `run_vm()` so
@@ -177,7 +200,16 @@ async fn main() -> Result<()> {
         // is negligible next to the parent gRPC server's uptime.
         maybe_reexec_internal_vm_with_runtime_env()?;
         let config = build_vm_launch_config(&args).map_err(|err| miette::miette!("{err}"))?;
+        // check if process has env variable OPENSHELL_KRUN_WORKER set
+        for env in config.env.clone() {
+            tracing::info!("env: {:?}", env);
+        }
         run_vm(&config).map_err(|err| miette::miette!("{err}"))?;
+        return Ok(());
+    }
+
+    if args.internal_e2fs_helper {
+        run_internal_e2fs_helper(&args).map_err(|err| miette::miette!("{err}"))?;
         return Ok(());
     }
 
@@ -227,6 +259,7 @@ async fn main() -> Result<()> {
     .map_err(|err| miette::miette!("{err}"))?;
 
     match listen_mode {
+        #[cfg(unix)]
         ComputeDriverListenMode::Unix {
             socket_path,
             expected_peer_pid,
@@ -244,6 +277,19 @@ async fn main() -> Result<()> {
             let _ = std::fs::remove_file(&socket_path);
             result
         }
+        #[cfg(windows)]
+        ComputeDriverListenMode::NamedPipe {
+            pipe_name,
+            expected_peer_pid,
+        } => {
+            info!(pipe = %pipe_name, "Starting vm compute driver");
+            let incoming = AuthenticatedNamedPipeIncoming::new(pipe_name, expected_peer_pid);
+            tonic::transport::Server::builder()
+                .add_service(ComputeDriverServer::new(driver))
+                .serve_with_incoming(incoming)
+                .await
+                .into_diagnostic()
+        }
         ComputeDriverListenMode::Tcp(bind_address) => {
             info!(address = %bind_address, "Starting unauthenticated dev vm compute driver");
             tonic::transport::Server::builder()
@@ -257,8 +303,14 @@ async fn main() -> Result<()> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ComputeDriverListenMode {
+    #[cfg(unix)]
     Unix {
         socket_path: PathBuf,
+        expected_peer_pid: Option<u32>,
+    },
+    #[cfg(windows)]
+    NamedPipe {
+        pipe_name: String,
         expected_peer_pid: Option<u32>,
     },
     Tcp(SocketAddr),
@@ -266,16 +318,45 @@ enum ComputeDriverListenMode {
 
 fn compute_driver_listen_mode(args: &Args) -> std::result::Result<ComputeDriverListenMode, String> {
     if let Some(socket_path) = args.bind_socket.clone() {
-        if args.expected_peer_pid.is_none() && !args.allow_same_uid_peer {
-            return Err(
-                "--expected-peer-pid is required with --bind-socket; use --allow-same-uid-peer only for local development"
-                    .to_string(),
-            );
+        #[cfg(unix)]
+        {
+            if args.expected_peer_pid.is_none() && !args.allow_same_uid_peer {
+                return Err(
+                    "--expected-peer-pid is required with --bind-socket; use --allow-same-uid-peer only for local development"
+                        .to_string(),
+                );
+            }
+            return Ok(ComputeDriverListenMode::Unix {
+                socket_path,
+                expected_peer_pid: args.expected_peer_pid,
+            });
         }
-        return Ok(ComputeDriverListenMode::Unix {
-            socket_path,
-            expected_peer_pid: args.expected_peer_pid,
-        });
+        #[cfg(windows)]
+        {
+            // On Windows `--bind-socket` carries a named pipe address
+            // (`\\.\pipe\...`, see `compute_driver_socket_path` in the
+            // gateway) rather than a filesystem path. `--allow-same-uid-peer`
+            // has no literal uid equivalent here; it's reused to mean
+            // "skip the peer-pid check", matching the Unix dev escape hatch.
+            let pipe_name = socket_path
+                .to_str()
+                .ok_or_else(|| "--bind-socket must be valid UTF-8 on Windows".to_string())?
+                .to_string();
+            if args.expected_peer_pid.is_none() && !args.allow_same_uid_peer {
+                return Err(
+                    "--expected-peer-pid is required with --bind-socket; use --allow-same-uid-peer only for local development"
+                        .to_string(),
+                );
+            }
+            return Ok(ComputeDriverListenMode::NamedPipe {
+                pipe_name,
+                expected_peer_pid: args.expected_peer_pid,
+            });
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            return Err("--bind-socket is not supported on this platform".to_string());
+        }
     }
 
     if !args.allow_unauthenticated_tcp {
@@ -292,6 +373,7 @@ fn compute_driver_listen_mode(args: &Args) -> std::result::Result<ComputeDriverL
     Ok(ComputeDriverListenMode::Tcp(bind_address))
 }
 
+#[cfg(unix)]
 fn prepare_compute_driver_socket(socket_path: &Path) -> std::result::Result<(), String> {
     let Some(parent) = socket_path.parent() else {
         return Err(format!(
@@ -304,10 +386,12 @@ fn prepare_compute_driver_socket(socket_path: &Path) -> std::result::Result<(), 
     remove_stale_socket(socket_path, expected_uid)
 }
 
+#[cfg(unix)]
 fn current_euid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
+#[cfg(unix)]
 fn prepare_private_socket_dir(
     socket_dir: &Path,
     expected_uid: u32,
@@ -341,6 +425,7 @@ fn prepare_private_socket_dir(
         .map_err(|err| format!("chmod socket dir {}: {err}", socket_dir.display()))
 }
 
+#[cfg(unix)]
 fn remove_stale_socket(socket_path: &Path, expected_uid: u32) -> std::result::Result<(), String> {
     let metadata = match std::fs::symlink_metadata(socket_path) {
         Ok(metadata) => metadata,
@@ -372,17 +457,20 @@ fn remove_stale_socket(socket_path: &Path, expected_uid: u32) -> std::result::Re
         .map_err(|err| format!("remove stale socket {}: {err}", socket_path.display()))
 }
 
+#[cfg(unix)]
 fn restrict_socket_permissions(socket_path: &Path) -> std::result::Result<(), String> {
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
         .map_err(|err| format!("chmod socket {}: {err}", socket_path.display()))
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PeerCredentials {
     uid: u32,
     pid: Option<i32>,
 }
 
+#[cfg(unix)]
 fn peer_credentials(stream: &UnixStream) -> std::result::Result<PeerCredentials, String> {
     let credentials = stream
         .peer_cred()
@@ -393,6 +481,7 @@ fn peer_credentials(stream: &UnixStream) -> std::result::Result<PeerCredentials,
     })
 }
 
+#[cfg(unix)]
 fn authorize_peer_credentials(
     peer: PeerCredentials,
     driver_uid: u32,
@@ -420,12 +509,14 @@ fn authorize_peer_credentials(
     Ok(())
 }
 
+#[cfg(unix)]
 struct AuthenticatedUnixIncoming {
     listener: UnixListener,
     expected_uid: u32,
     expected_peer_pid: Option<u32>,
 }
 
+#[cfg(unix)]
 impl AuthenticatedUnixIncoming {
     fn new(listener: UnixListener, expected_peer_pid: Option<u32>) -> Self {
         Self {
@@ -436,6 +527,7 @@ impl AuthenticatedUnixIncoming {
     }
 }
 
+#[cfg(unix)]
 impl Stream for AuthenticatedUnixIncoming {
     type Item = io::Result<UnixStream>;
 
@@ -461,6 +553,191 @@ impl Stream for AuthenticatedUnixIncoming {
                 Poll::Pending => return Poll::Pending,
             }
         }
+    }
+}
+
+/// Authorize a named pipe peer by process id — the closest Windows
+/// equivalent of the Unix path's uid+pid check (there is no uid analog for
+/// this purely host-local IPC channel, so pid is the whole story here).
+#[cfg(windows)]
+fn authorize_named_pipe_peer(
+    peer_pid: u32,
+    expected_peer_pid: Option<u32>,
+) -> std::result::Result<(), String> {
+    let Some(expected_peer_pid) = expected_peer_pid else {
+        return Ok(());
+    };
+    if peer_pid != expected_peer_pid {
+        return Err(format!(
+            "peer pid {peer_pid} does not match expected gateway pid {expected_peer_pid}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn named_pipe_peer_pid(server: &NamedPipeServer) -> std::result::Result<u32, String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
+
+    let handle = server.as_raw_handle() as isize as HANDLE;
+    let mut pid: u32 = 0;
+    // SAFETY: `handle` is a valid, open named pipe server handle owned by
+    // `server` for the duration of this call; `pid` is a valid out-param.
+    let ok = unsafe { GetNamedPipeClientProcessId(handle, &raw mut pid) };
+    if ok == 0 {
+        return Err(format!(
+            "GetNamedPipeClientProcessId failed: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(pid)
+}
+
+/// Create a fresh named pipe instance and wait for a client to connect to
+/// it. `first` must be `true` only for the very first instance of
+/// `pipe_name` — this makes pipe creation fail immediately (instead of on
+/// first connection) if another process is already listening on the same
+/// name, mirroring how the Unix path refuses to bind over a live socket.
+#[cfg(windows)]
+async fn accept_named_pipe(pipe_name: String, first: bool) -> io::Result<NamedPipeServer> {
+    let server = ServerOptions::new()
+        .first_pipe_instance(first)
+        .create(&pipe_name)?;
+    server.connect().await?;
+    Ok(server)
+}
+
+/// A `Stream` of authenticated named pipe connections, mirroring
+/// `AuthenticatedUnixIncoming` for Windows. Named pipes require a fresh
+/// server instance per connection (unlike a Unix `accept()` loop on one
+/// listener fd), so this keeps a pending "accept next client" future
+/// around and re-arms it immediately after each connection — including
+/// rejected ones — so a subsequent client is never left unable to connect.
+#[cfg(windows)]
+struct AuthenticatedNamedPipeIncoming {
+    pipe_name: String,
+    expected_peer_pid: Option<u32>,
+    accept: Pin<Box<dyn Future<Output = io::Result<NamedPipeServer>> + Send>>,
+}
+
+#[cfg(windows)]
+impl AuthenticatedNamedPipeIncoming {
+    fn new(pipe_name: String, expected_peer_pid: Option<u32>) -> Self {
+        Self {
+            accept: Box::pin(accept_named_pipe(pipe_name.clone(), true)),
+            pipe_name,
+            expected_peer_pid,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Stream for AuthenticatedNamedPipeIncoming {
+    type Item = io::Result<ConnectedNamedPipe>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            match this.accept.as_mut().poll(cx) {
+                Poll::Ready(Ok(server)) => {
+                    // Immediately queue the next instance so a subsequent
+                    // client (e.g. a gRPC channel reconnect) can connect
+                    // while this one is handed off to tonic.
+                    this.accept = Box::pin(accept_named_pipe(this.pipe_name.clone(), false));
+
+                    let authorized = named_pipe_peer_pid(&server)
+                        .and_then(|peer_pid| authorize_named_pipe_peer(peer_pid, this.expected_peer_pid));
+                    match authorized {
+                        Ok(()) => return Poll::Ready(Some(Ok(ConnectedNamedPipe(server)))),
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "rejected vm compute driver named pipe client"
+                            );
+                        }
+                    }
+                }
+                Poll::Ready(Err(err)) => {
+                    this.accept = Box::pin(accept_named_pipe(this.pipe_name.clone(), false));
+                    return Poll::Ready(Some(Err(err)));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct ConnectedNamedPipe(NamedPipeServer);
+
+#[cfg(windows)]
+impl tonic::transport::server::Connected for ConnectedNamedPipe {
+    type ConnectInfo = ();
+
+    fn connect_info(&self) -> Self::ConnectInfo {}
+}
+
+#[cfg(windows)]
+impl tokio::io::AsyncRead for ConnectedNamedPipe {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+#[cfg(windows)]
+impl tokio::io::AsyncWrite for ConnectedNamedPipe {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+fn run_internal_e2fs_helper(args: &Args) -> std::result::Result<(), String> {
+    let runtime_dir = args
+        .e2fs_runtime_dir
+        .as_ref()
+        .ok_or_else(|| "--e2fs-runtime-dir is required in e2fs helper mode".to_string())?;
+    let helper_rootfs = args
+        .e2fs_helper_rootfs
+        .as_ref()
+        .ok_or_else(|| "--e2fs-helper-rootfs is required in e2fs helper mode".to_string())?;
+    let data_disk = args
+        .e2fs_data_disk
+        .as_ref()
+        .ok_or_else(|| "--e2fs-data-disk is required in e2fs helper mode".to_string())?;
+
+    let mut arg_values = Vec::new();
+    for arg in &args.e2fs_args {
+        arg_values.push(std::ffi::CString::new(arg.as_str()).unwrap());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        openshell_driver_vm::e2fs_vm::exec_vm(runtime_dir, data_disk, helper_rootfs, arg_values)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (runtime_dir, helper_rootfs, data_disk, console_output, exec_command, virtiofs_shares);
+        Err("--internal-e2fs-helper is only supported on Windows".to_string())
     }
 }
 

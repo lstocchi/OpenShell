@@ -156,7 +156,7 @@ fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
 /// Handles Cloudflare Access and OIDC auth modes by loading the stored token
 /// and setting it on `TlsOptions`. For OIDC, automatically refreshes the token
 /// if it's near expiry.
-fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
+async fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
     let Some(meta) = get_gateway_metadata(gateway_name) else {
         return;
     };
@@ -435,7 +435,7 @@ struct Cli {
     version: (),
 
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Option<Box<Commands>>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1935,21 +1935,47 @@ enum ServiceCommands {
     },
 }
 
-#[tokio::main]
-#[allow(clippy::large_stack_frames)] // CLI dispatch holds many futures; OK at top level.
-async fn main() -> Result<()> {
+/* #[tokio::main]
+#[allow(clippy::large_stack_frames)] */ // CLI dispatch holds many futures; OK at top level.
+fn main() -> Result<()> {
+    // Run clap parsing inside a thread with an 8MB stack to prevent Windows overflow
+    let cli = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| Cli::parse())
+        .map_err(|e| miette::miette!("failed to spawn parser thread: {e}"))?
+        .join()
+        .map_err(|_| miette::miette!("CLI parser thread panicked"))?;
+
+    // Initialize tokio runtime AFTER parsing CLI args
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| miette::miette!("failed to build tokio runtime: {e}"))?;
+
+    runtime.block_on(async_main(cli))
+}
+
+async fn async_main(cli: Cli) -> Result<()> {
+
+    eprintln!("Starting OpenShell CLI");
     // Install the rustls crypto provider before completion runs — completers may
     // establish TLS connections to the gateway.
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|e| miette::miette!("failed to install rustls crypto provider: {e:?}"))?;
 
-    CompleteEnv::with_factory(Cli::command).complete();
+    if std::env::var_os("COMPLETE").is_some() {
+        eprintln!("Installing CLI command completions");
+        CompleteEnv::with_factory(Cli::command).complete();
+    }
 
+    eprintln!("Parsing CLI arguments");
     let cli = Cli::parse();
+    eprintln!("CLI arguments parsed: {cli:?}");
     let mut tls = TlsOptions::default();
+    eprintln!("TLS options: {tls:?}");
     tls.gateway_insecure = cli.gateway_insecure;
-
+    eprintln!("TLS options: {tls:?}");
     // Set up logging based on verbosity
     let log_level = match cli.verbose {
         0 => "warn",
@@ -1981,8 +2007,8 @@ async fn main() -> Result<()> {
             std::env::set_var("OPENSHELL_SSH_LOG_LEVEL", ssh_log_level);
         }
     }
-
-    match cli.command {
+    eprintln!("CLI: {cli:?}");
+    match cli.command.map(|b| *b) {
         // -----------------------------------------------------------
         // Gateway commands (was `cluster` / `cluster admin`)
         // -----------------------------------------------------------

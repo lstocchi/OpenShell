@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "windows"))]
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -33,6 +34,7 @@ pub fn prepare_sandbox_rootfs_from_image_root(
     sandbox_uid: u32,
     sandbox_gid: u32,
 ) -> Result<(), String> {
+    eprintln!("prepare_sandbox_rootfs_from_image_root: {rootfs:?} {image_identity:?} {sandbox_uid:?} {sandbox_gid:?}");
     prepare_sandbox_rootfs(rootfs, sandbox_uid, sandbox_gid)?;
     validate_sandbox_rootfs(rootfs)?;
     fs::write(
@@ -158,28 +160,55 @@ pub fn write_rootfs_image_file(
     guest_path: &str,
     contents: &[u8],
 ) -> Result<(), String> {
-    ensure_rootfs_image_parent_dirs(image_path, guest_path);
+    #[cfg(target_os = "windows")]
+    {
+        let tmp_path = temporary_injection_path(image_path);
+        fs::write(&tmp_path, contents)
+            .map_err(|e| format!("write {}: {e}", tmp_path.display()))?;
+        let Some(quoted_guest_path) = debugfs_quote_absolute_path(guest_path) else {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!("invalid debugfs guest path '{guest_path}'"));
+        };
+        let Some(quoted_tmp_path) = debugfs_quote_argument(&tmp_path.to_string_lossy()) else {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!(
+                "invalid debugfs injection path '{}'",
+                tmp_path.display()
+            ));
+        };
 
-    let tmp_path = temporary_injection_path(image_path);
-    fs::write(&tmp_path, contents).map_err(|e| format!("write {}: {e}", tmp_path.display()))?;
-    let Some(quoted_guest_path) = debugfs_quote_absolute_path(guest_path) else {
+        let _ = crate::e2fs_vm::run_debugfs_via_vm(image_path, &format!("rm {quoted_guest_path}"));
+        let result = crate::e2fs_vm::run_debugfs_via_vm(image_path, &format!("write {quoted_tmp_path} {quoted_guest_path}"));
         let _ = fs::remove_file(&tmp_path);
-        return Err(format!("invalid debugfs guest path '{guest_path}'"));
-    };
-    let Some(quoted_tmp_path) = debugfs_quote_argument(&tmp_path.to_string_lossy()) else {
+        result
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        ensure_rootfs_image_parent_dirs(image_path, guest_path);
+
+        let tmp_path = temporary_injection_path(image_path);
+        fs::write(&tmp_path, contents)
+            .map_err(|e| format!("write {}: {e}", tmp_path.display()))?;
+        let Some(quoted_guest_path) = debugfs_quote_absolute_path(guest_path) else {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!("invalid debugfs guest path '{guest_path}'"));
+        };
+        let Some(quoted_tmp_path) = debugfs_quote_argument(&tmp_path.to_string_lossy()) else {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!(
+                "invalid debugfs injection path '{}'",
+                tmp_path.display()
+            ));
+        };
+        let _ = run_debugfs(image_path, &format!("rm {quoted_guest_path}"));
+        let result = run_debugfs(
+            image_path,
+            &format!("write {quoted_tmp_path} {quoted_guest_path}"),
+        );
         let _ = fs::remove_file(&tmp_path);
-        return Err(format!(
-            "invalid debugfs injection path '{}'",
-            tmp_path.display()
-        ));
-    };
-    let _ = run_debugfs(image_path, &format!("rm {quoted_guest_path}"));
-    let result = run_debugfs(
-        image_path,
-        &format!("write {quoted_tmp_path} {quoted_guest_path}"),
-    );
-    let _ = fs::remove_file(&tmp_path);
-    result
+        result
+    }
 }
 
 pub fn set_rootfs_image_file_mode(
@@ -187,14 +216,29 @@ pub fn set_rootfs_image_file_mode(
     guest_path: &str,
     mode: u32,
 ) -> Result<(), String> {
-    let regular_file_mode = 0o100_000 | (mode & 0o7777);
-    let Some(quoted_guest_path) = debugfs_quote_absolute_path(guest_path) else {
-        return Err(format!("invalid debugfs guest path '{guest_path}'"));
-    };
-    run_debugfs(
-        image_path,
-        &format!("set_inode_field {quoted_guest_path} mode 0{regular_file_mode:o}"),
-    )
+    #[cfg(target_os = "windows")]
+    {
+        let regular_file_mode = 0o100_000 | (mode & 0o7777);
+        let Some(quoted_guest_path) = debugfs_quote_absolute_path(guest_path) else {
+            return Err(format!("invalid debugfs guest path '{guest_path}'"));
+        };
+        crate::e2fs_vm::run_debugfs_via_vm(
+            image_path,
+            &format!("set_inode_field {quoted_guest_path} mode 0{regular_file_mode:o}"),
+        )
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let regular_file_mode = 0o100_000 | (mode & 0o7777);
+        let Some(quoted_guest_path) = debugfs_quote_absolute_path(guest_path) else {
+            return Err(format!("invalid debugfs guest path '{guest_path}'"));
+        };
+        run_debugfs(
+            image_path,
+            &format!("set_inode_field {quoted_guest_path} mode 0{regular_file_mode:o}"),
+        )
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -395,7 +439,7 @@ pub fn validate_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
     require_rootfs_path(rootfs, SANDBOX_GUEST_INIT_PATH)?;
     require_rootfs_path(rootfs, SANDBOX_SUPERVISOR_PATH)?;
     require_rootfs_path(rootfs, SANDBOX_UMOCI_PATH)?;
-    require_any_rootfs_path(rootfs, &["/bin/bash"])?;
+    require_any_rootfs_path(rootfs, &["/bin/bash", "/usr/bin/bash"])?;
     require_any_rootfs_path(rootfs, &["/bin/mount", "/usr/bin/mount"])?;
     require_any_rootfs_path(
         rootfs,
@@ -462,47 +506,56 @@ fn round_up_to_mib(bytes: u64) -> u64 {
 }
 
 fn format_ext4_image_from_dir(source: &Path, image_path: &Path) -> Result<(), String> {
-    let mut last_error = None;
-    for tool in ["mke2fs", "mkfs.ext4"] {
-        for candidate in e2fs_tool_candidates(tool) {
-            let label = candidate.display().to_string();
-            let output = Command::new(&candidate)
-                .arg("-q")
-                .arg("-F")
-                .arg("-t")
-                .arg("ext4")
-                .arg("-E")
-                .arg("root_owner=0:0")
-                .arg("-d")
-                .arg(source)
-                .arg(image_path)
-                .output();
-            match output {
-                Ok(output) if output.status.success() => return Ok(()),
-                Ok(output) => {
-                    last_error = Some(format!(
-                        "{label} failed with status {}\nstdout: {}\nstderr: {}",
-                        output.status,
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
-                    ));
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    last_error = Some(format!("{label} not found"));
-                }
-                Err(err) => {
-                    last_error = Some(format!("run {label}: {err}"));
+    #[cfg(target_os = "windows")]
+    {
+        crate::e2fs_vm::format_ext4_via_vm(source, image_path)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut last_error = None;
+        for tool in ["mke2fs", "mkfs.ext4"] {
+            for candidate in e2fs_tool_candidates(tool) {
+                let label = candidate.display().to_string();
+                let output = Command::new(&candidate)
+                    .arg("-q")
+                    .arg("-F")
+                    .arg("-t")
+                    .arg("ext4")
+                    .arg("-E")
+                    .arg("root_owner=0:0")
+                    .arg("-d")
+                    .arg(source)
+                    .arg(image_path)
+                    .output();
+                match output {
+                    Ok(output) if output.status.success() => return Ok(()),
+                    Ok(output) => {
+                        last_error = Some(format!(
+                            "{label} failed with status {}\nstdout: {}\nstderr: {}",
+                            output.status,
+                            String::from_utf8_lossy(&output.stdout),
+                            String::from_utf8_lossy(&output.stderr)
+                        ));
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        last_error = Some(format!("{label} not found"));
+                    }
+                    Err(err) => {
+                        last_error = Some(format!("run {label}: {err}"));
+                    }
                 }
             }
         }
+        Err(format!(
+            "failed to create ext4 rootfs image from {}: {}. Install e2fsprogs (mke2fs/mkfs.ext4) and retry",
+            source.display(),
+            last_error.unwrap_or_else(|| "no ext4 formatter found".to_string())
+        ))
     }
-    Err(format!(
-        "failed to create ext4 rootfs image from {}: {}. Install e2fsprogs (mke2fs/mkfs.ext4) and retry",
-        source.display(),
-        last_error.unwrap_or_else(|| "no ext4 formatter found".to_string())
-    ))
 }
 
+#[cfg(not(target_os = "windows"))]
 fn ensure_rootfs_image_parent_dirs(image_path: &Path, guest_path: &str) {
     let Some(parent) = Path::new(guest_path).parent() else {
         return;
@@ -598,6 +651,7 @@ fn collect_sandbox_owner_commands(
     Ok(true)
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn debugfs_quote_absolute_path(path: &str) -> Option<String> {
     if path.is_empty() || !path.starts_with('/') {
         return None;
@@ -606,6 +660,7 @@ fn debugfs_quote_absolute_path(path: &str) -> Option<String> {
     debugfs_quote_argument(path)
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn debugfs_quote_argument(argument: &str) -> Option<String> {
     if argument.is_empty() {
         return None;
@@ -668,76 +723,94 @@ fn run_debugfs_batch(image_path: &Path, commands: &[String]) -> Result<(), Strin
 }
 
 fn run_debugfs_batch_file(image_path: &Path, command_path: &Path) -> Result<(), String> {
-    let mut last_error = None;
-    for candidate in e2fs_tool_candidates("debugfs") {
-        let label = candidate.display().to_string();
-        let output = Command::new(&candidate)
-            .arg("-w")
-            .arg("-f")
-            .arg(command_path)
-            .arg(image_path)
-            .output();
-        match output {
-            Ok(output) if output.status.success() => return Ok(()),
-            Ok(output) => {
-                last_error = Some(format!(
-                    "{label} failed with status {}\nstdout: {}\nstderr: {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                last_error = Some(format!("{label} not found"));
-            }
-            Err(err) => {
-                last_error = Some(format!("run {label}: {err}"));
+    #[cfg(target_os = "windows")]
+    {
+        return crate::e2fs_vm::run_debugfs_batch_file_via_vm(image_path, command_path);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut last_error = None;
+        for candidate in e2fs_tool_candidates("debugfs") {
+            let label = candidate.display().to_string();
+            let output = Command::new(&candidate)
+                .arg("-w")
+                .arg("-f")
+                .arg(command_path)
+                .arg(image_path)
+                .output();
+            match output {
+                Ok(output) if output.status.success() => return Ok(()),
+                Ok(output) => {
+                    last_error = Some(format!(
+                        "{label} failed with status {}\nstdout: {}\nstderr: {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    last_error = Some(format!("{label} not found"));
+                }
+                Err(err) => {
+                    last_error = Some(format!("run {label}: {err}"));
+                }
             }
         }
+        Err(format!(
+            "debugfs batch {} failed for {}: {}. Install e2fsprogs (debugfs) and retry",
+            command_path.display(),
+            image_path.display(),
+            last_error.unwrap_or_else(|| "debugfs not found".to_string())
+        ))
     }
-    Err(format!(
-        "debugfs batch {} failed for {}: {}. Install e2fsprogs (debugfs) and retry",
-        command_path.display(),
-        image_path.display(),
-        last_error.unwrap_or_else(|| "debugfs not found".to_string())
-    ))
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn run_debugfs(image_path: &Path, command: &str) -> Result<(), String> {
-    let mut last_error = None;
-    for candidate in e2fs_tool_candidates("debugfs") {
-        let label = candidate.display().to_string();
-        let output = Command::new(&candidate)
-            .arg("-w")
-            .arg("-R")
-            .arg(command)
-            .arg(image_path)
-            .output();
-        match output {
-            Ok(output) if output.status.success() => return Ok(()),
-            Ok(output) => {
-                last_error = Some(format!(
-                    "{label} failed with status {}\nstdout: {}\nstderr: {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                last_error = Some(format!("{label} not found"));
-            }
-            Err(err) => {
-                last_error = Some(format!("run {label}: {err}"));
+    #[cfg(target_os = "windows")]
+    {
+        return crate::e2fs_vm::run_debugfs_via_vm(image_path, command);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut last_error = None;
+        for candidate in e2fs_tool_candidates("debugfs") {
+            let label = candidate.display().to_string();
+            let output = Command::new(&candidate)
+                .arg("-w")
+                .arg("-R")
+                .arg(command)
+                .arg(image_path)
+                .output();
+            match output {
+                Ok(output) if output.status.success() => return Ok(()),
+                Ok(output) => {
+                    last_error = Some(format!(
+                        "{label} failed with status {}\nstdout: {}\nstderr: {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    last_error = Some(format!("{label} not found"));
+                }
+                Err(err) => {
+                    last_error = Some(format!("run {label}: {err}"));
+                }
             }
         }
+        Err(format!(
+            "debugfs command '{command}' failed for {}: {}. Install e2fsprogs (debugfs) and retry",
+            image_path.display(),
+            last_error.unwrap_or_else(|| "debugfs not found".to_string())
+        ))
     }
-    Err(format!(
-        "debugfs command '{command}' failed for {}: {}. Install e2fsprogs (debugfs) and retry",
-        image_path.display(),
-        last_error.unwrap_or_else(|| "debugfs not found".to_string())
-    ))
 }
 
+#[cfg(not(target_os = "windows"))]
 fn e2fs_tool_candidates(tool: &str) -> Vec<PathBuf> {
     let mut candidates = vec![PathBuf::from(tool)];
     for root in ["/opt/homebrew/opt/e2fsprogs", "/usr/local/opt/e2fsprogs"] {

@@ -257,6 +257,7 @@ pub fn driver_table(
 /// in a driver table that does not understand the field.
 fn inheritable_keys(driver_name: &str) -> &'static [&'static str] {
     match driver_name.parse::<ComputeDriverKind>().ok() {
+        #[cfg(unix)]
         Some(ComputeDriverKind::Kubernetes) => &[
             "namespace",
             "default_image",
@@ -267,6 +268,7 @@ fn inheritable_keys(driver_name: &str) -> &'static [&'static str] {
             "enable_user_namespaces",
             "sa_token_ttl_secs",
         ],
+        #[cfg(unix)]
         Some(ComputeDriverKind::Docker) => &[
             "sandbox_namespace",
             "default_image",
@@ -276,6 +278,7 @@ fn inheritable_keys(driver_name: &str) -> &'static [&'static str] {
             "guest_tls_cert",
             "guest_tls_key",
         ],
+        #[cfg(unix)]
         Some(ComputeDriverKind::Podman) => &[
             "default_image",
             "supervisor_image",

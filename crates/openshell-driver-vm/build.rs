@@ -19,7 +19,10 @@ fn main() {
             "libkrunfw.so.5.zst",
             "libkrun.dylib.zst",
             "libkrunfw.5.dylib.zst",
+            "libkrun.dll.zst",
+            "libkrunfw.dll.zst",
             "gvproxy.zst",
+            "gvproxy.exe.zst",
             "openshell-sandbox.zst",
             "umoci.zst",
         ] {
@@ -31,17 +34,38 @@ fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
 
-    let (libkrun_name, libkrunfw_name) = match target_os.as_str() {
-        "macos" => ("libkrun.dylib", "libkrunfw.5.dylib"),
-        "linux" => ("libkrun.so", "libkrunfw.so.5"),
+    let (libkrun_name, libkrunfw_name, gvproxy_name) = match target_os.as_str() {
+        "macos" => ("libkrun.dylib", "libkrunfw.5.dylib", "gvproxy"),
+        "linux" => ("libkrun.so", "libkrunfw.so.5", "gvproxy"),
+        "windows" => ("libkrun.dll", "libkrunfw.dll", "gvproxy.exe"),
         _ => {
             println!("cargo:warning=VM runtime not available for {target_os}-{target_arch}");
             generate_stub_resources(
                 &out_dir,
-                &["libkrun", "libkrunfw", "openshell-sandbox.zst", "umoci.zst"],
+                &[
+                    "libkrun",
+                    "libkrunfw",
+                    "openshell-sandbox.zst",
+                    "umoci.zst",
+                    "e2fs-helper.ext4.zst",
+                ],
             );
             return;
         }
+    };
+
+    let stub_names: Vec<&str> = {
+        let mut names = vec![
+            leak_format(&format!("{libkrun_name}.zst")),
+            leak_format(&format!("{libkrunfw_name}.zst")),
+            leak_format(&format!("{gvproxy_name}.zst")),
+            "openshell-sandbox.zst",
+            "umoci.zst",
+        ];
+        if target_os == "windows" {
+            names.push("e2fs-helper.ext4.zst");
+        }
+        names
     };
 
     let compressed_dir = if let Ok(dir) = env::var("OPENSHELL_VM_RUNTIME_COMPRESSED_DIR") {
@@ -49,16 +73,7 @@ fn main() {
     } else {
         println!("cargo:warning=OPENSHELL_VM_RUNTIME_COMPRESSED_DIR not set");
         println!("cargo:warning=Run: mise run vm:setup && mise run vm:supervisor");
-        generate_stub_resources(
-            &out_dir,
-            &[
-                &format!("{libkrun_name}.zst"),
-                &format!("{libkrunfw_name}.zst"),
-                "gvproxy.zst",
-                "openshell-sandbox.zst",
-                "umoci.zst",
-            ],
-        );
+        generate_stub_resources(&out_dir, &stub_names);
         return;
     };
 
@@ -68,32 +83,30 @@ fn main() {
             compressed_dir.display()
         );
         println!("cargo:warning=Run: mise run vm:setup && mise run vm:supervisor");
-        generate_stub_resources(
-            &out_dir,
-            &[
-                &format!("{libkrun_name}.zst"),
-                &format!("{libkrunfw_name}.zst"),
-                "gvproxy.zst",
-                "openshell-sandbox.zst",
-                "umoci.zst",
-            ],
-        );
+        generate_stub_resources(&out_dir, &stub_names);
         return;
     }
 
-    let files = [
+    let mut files = vec![
         (format!("{libkrun_name}.zst"), format!("{libkrun_name}.zst")),
         (
             format!("{libkrunfw_name}.zst"),
             format!("{libkrunfw_name}.zst"),
         ),
-        ("gvproxy.zst".to_string(), "gvproxy.zst".to_string()),
+        (format!("{gvproxy_name}.zst"), format!("{gvproxy_name}.zst")),
         (
             "openshell-sandbox.zst".to_string(),
             "openshell-sandbox.zst".to_string(),
         ),
         ("umoci.zst".to_string(), "umoci.zst".to_string()),
     ];
+
+    if target_os == "windows" {
+        files.push((
+            "e2fs-helper.ext4.zst".to_string(),
+            "e2fs-helper.ext4.zst".to_string(),
+        ));
+    }
 
     let mut all_found = true;
     for (src_name, dst_name) in &files {
@@ -128,16 +141,7 @@ fn main() {
         println!(
             "cargo:warning=Some artifacts missing. Run: mise run vm:setup && mise run vm:supervisor"
         );
-        generate_stub_resources(
-            &out_dir,
-            &[
-                &format!("{libkrun_name}.zst"),
-                &format!("{libkrunfw_name}.zst"),
-                "gvproxy.zst",
-                "openshell-sandbox.zst",
-                "umoci.zst",
-            ],
-        );
+        generate_stub_resources(&out_dir, &stub_names);
     }
 }
 
@@ -149,4 +153,8 @@ fn generate_stub_resources(out_dir: &Path, names: &[&str]) {
                 .unwrap_or_else(|e| panic!("Failed to write stub {}: {}", path.display(), e));
         }
     }
+}
+
+fn leak_format(s: &str) -> &'static str {
+    Box::leak(s.to_string().into_boxed_str())
 }

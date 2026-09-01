@@ -52,9 +52,12 @@ pub const DEFAULT_SANDBOX_PIDS_LIMIT: i64 = 2048;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComputeDriverKind {
+    #[cfg(unix)]
     Kubernetes,
     Vm,
+    #[cfg(unix)]
     Docker,
+    #[cfg(unix)]
     Podman,
 }
 
@@ -62,9 +65,12 @@ impl ComputeDriverKind {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            #[cfg(unix)]
             Self::Kubernetes => "kubernetes",
             Self::Vm => "vm",
+            #[cfg(unix)]
             Self::Docker => "docker",
+            #[cfg(unix)]
             Self::Podman => "podman",
         }
     }
@@ -102,9 +108,12 @@ impl FromStr for ComputeDriverKind {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
+            #[cfg(unix)]
             "kubernetes" => Ok(Self::Kubernetes),
             "vm" => Ok(Self::Vm),
+            #[cfg(unix)]
             "docker" => Ok(Self::Docker),
+            #[cfg(unix)]
             "podman" => Ok(Self::Podman),
             other => Err(format!(
                 "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman"
@@ -122,16 +131,19 @@ impl FromStr for ComputeDriverKind {
 /// Returns `None` if no compatible driver is found.
 pub fn detect_driver() -> Option<ComputeDriverKind> {
     // Kubernetes: check for KUBERNETES_SERVICE_HOST env var (set inside pods)
+    #[cfg(unix)]
     if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
         return Some(ComputeDriverKind::Kubernetes);
     }
 
     // Podman: check for a reachable local API socket.
+    #[cfg(unix)]
     if is_podman_available() {
         return Some(ComputeDriverKind::Podman);
     }
 
     // Docker: check if the CLI is available or a local Docker socket exists.
+    #[cfg(unix)]
     if is_docker_available() {
         return Some(ComputeDriverKind::Docker);
     }

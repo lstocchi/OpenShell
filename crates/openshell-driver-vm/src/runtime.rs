@@ -628,25 +628,40 @@ impl Drop for TapGuard {
 fn procguard_kill_children() {
     let helper_pid = GVPROXY_PID.load(Ordering::Relaxed);
     let child_pid = CHILD_PID.load(Ordering::Relaxed);
-    if helper_pid > 0 {
-        unsafe {
-            libc::kill(helper_pid, libc::SIGTERM);
+    #[cfg(not(target_os = "windows"))] {
+        if helper_pid > 0 {
+            unsafe {
+                libc::kill(helper_pid, libc::SIGTERM);
+            }
+        }
+        if child_pid > 0 {
+            unsafe {
+                libc::kill(child_pid, libc::SIGTERM);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        if helper_pid > 0 {
+            unsafe {
+                libc::kill(helper_pid, libc::SIGKILL);
+            }
+        }
+        if child_pid > 0 {
+            unsafe {
+                libc::kill(child_pid, libc::SIGKILL);
+            }
         }
     }
-    if child_pid > 0 {
-        unsafe {
-            libc::kill(child_pid, libc::SIGTERM);
+    #[cfg(target_os = "windows")]
+    {
+        if helper_pid > 0 {
+            unsafe {
+                //windows_sys::Win32::System::Threading::TerminateProcess(helper_pid, 1);
+            }
         }
-    }
-    std::thread::sleep(Duration::from_millis(200));
-    if helper_pid > 0 {
-        unsafe {
-            libc::kill(helper_pid, libc::SIGKILL);
-        }
-    }
-    if child_pid > 0 {
-        unsafe {
-            libc::kill(child_pid, libc::SIGKILL);
+        if child_pid > 0 {
+            unsafe {
+                //windows_sys::Win32::System::Threading::TerminateProcess(child_pid, 1);
+            }
         }
     }
 }
@@ -739,8 +754,42 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
     // deliberately omitted: nothing in the driver enqueues port
     // forwards on the API any more, and the host-side SSH listener is
     // dead plumbing.
+    if config.env.iter().any(|env| env.starts_with("OPENSHELL_KRUN_WORKER")) {
+        tracing::info!("OPENSHELL_KRUN_WORKER set");
+        let sock_base = gvproxy_socket_base(&config.overlay_disk)?;
+        let net_sock = sock_base.with_extension("v");
+        
+        let mac: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
+
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        vm.add_net_unixstream(&net_sock, &mac, COMPAT_NET_FEATURES)?;
+
+        vm.set_console_output(&config.console_output)?;
+
+        let env = if config.env.is_empty() {
+            vec![
+                "HOME=/root".to_string(),
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+                "TERM=xterm".to_string(),
+            ]
+        } else {
+            config.env.clone()
+        };
+        vm.set_exec(&config.exec_path, &config.args, &env)?;
+
+        return run_worker_process(vm, None);
+    }
     let gvproxy_guard = {
-        let gvproxy_binary = runtime_dir.join("gvproxy");
+        let gvproxy_binary = {
+            #[cfg(target_os = "windows")]
+            {
+                runtime_dir.join("gvproxy.exe")
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                runtime_dir.join("gvproxy")
+            }
+        };
         if !gvproxy_binary.is_file() {
             return Err(format!(
                 "missing runtime file: {}",
@@ -758,15 +807,23 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
         let gvproxy_log_file = std::fs::File::create(&gvproxy_log)
             .map_err(|e| format!("create gvproxy log {}: {e}", gvproxy_log.display()))?;
 
-        #[cfg(target_os = "linux")]
-        let (gvproxy_net_flag, gvproxy_net_url) =
-            ("-listen-qemu", format!("unix://{}", net_sock.display()));
-        #[cfg(target_os = "macos")]
-        let (gvproxy_net_flag, gvproxy_net_url) = (
-            "-listen-vfkit",
-            format!("unixgram://{}", net_sock.display()),
-        );
 
+        let (gvproxy_net_flag, gvproxy_net_url) = {
+            #[cfg(target_os = "linux")]
+            {
+                ("-listen-qemu", format!("unix://{}", net_sock.display()))
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let normalized_path = net_sock.to_string_lossy().replace('\\', "/");
+                let clean_path = normalized_path.trim_start_matches('/');
+                ("-listen-qemu", format!("unix:///{}", clean_path))
+            }
+            #[cfg(target_os = "macos")]
+            {
+                ("-listen-vfkit", format!("unixgram://{}", net_sock.display()))
+            }
+        };
         // `-ssh-port -1` tells gvproxy to skip its default SSH forward
         // (127.0.0.1:2222 → guest:22). We don't use it — all gateway
         // ingress rides the supervisor-initiated relay — and leaving
@@ -784,6 +841,8 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(gvproxy_log_file);
+
+        tracing::info!("gvproxy command: {:?}", gvproxy_cmd);
 
         // On Linux the kernel will SIGKILL gvproxy the moment this
         // launcher dies (or is SIGKILLed). `pre_exec` runs in the child
@@ -815,12 +874,15 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
 
         wait_for_path(&net_sock, Duration::from_secs(5), "gvproxy data socket")?;
 
-        vm.disable_implicit_vsock()?;
-        vm.add_vsock(0)?;
+        #[cfg(not(target_os = "windows"))]
+        {
+            vm.disable_implicit_vsock()?;
+            vm.add_vsock(0)?;
+        }
 
         let mac: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         vm.add_net_unixstream(&net_sock, &mac, COMPAT_NET_FEATURES)?;
         #[cfg(target_os = "macos")]
         {
@@ -844,6 +906,11 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
     };
     vm.set_exec(&config.exec_path, &config.args, &env)?;
 
+    run_worker_process(vm, gvproxy_guard)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn run_worker_process(vm: VmContext, gvproxy_guard: Option<GvproxyGuard>) -> Result<(), String> {
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => Err(format!("fork failed: {}", std::io::Error::last_os_error())),
@@ -886,6 +953,61 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
                 Err(format!("VM exited with unexpected wait status {status}"))
             }
         }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_worker_process(vm: VmContext, gvproxy_guard: Option<GvproxyGuard>) -> Result<(), String> {
+    // If we are the Monitor process, spawn the Worker process
+    if gvproxy_guard.is_some() {
+        let exe = std::env::current_exe().map_err(|e| format!("failed to get exe: {}", e))?;
+        
+        // Re-run the exact same command, but set the environment variable
+        let mut cmd = std::process::Command::new(exe);
+/*         cmd.args(std::env::args().skip(1)) // Pass along all the --internal-run-vm args
+           .env("OPENSHELL_KRUN_WORKER", "1")
+           .env("OPENSHELL_KRUN_WORKER_PID", std::process::id().to_string()); */
+
+        let pid = std::process::id().to_string();
+        cmd.args(std::env::args().skip(1));
+        cmd
+            .arg("--vm-env")
+           .arg("OPENSHELL_KRUN_WORKER=1")
+           .arg("--vm-env")
+           .arg(format!("OPENSHELL_KRUN_WORKER_PID={pid}"));
+        
+        // Hide the console window
+        /* use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); */ // CREATE_NO_WINDOW
+
+        println!("Spawning worker process with command: {:?}", cmd);
+
+        let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn Windows worker: {}", e))?;
+        
+        tracing::info!("Worker process spawned with id: {:?}", child.id());
+        // TODO: On Windows, use Job Objects to ensure `gvproxy` and the `child` worker 
+        // die if this monitor process is killed.
+        
+        let status = child.wait().map_err(|e| format!("Failed to wait for worker: {}", e))?;
+
+        tracing::info!("Worker process status: {:?}", status);
+        
+        cleanup_gvproxy(gvproxy_guard);
+        
+        if status.success() {
+            return Ok(());
+        } else {
+            return Err(format!("VM exited with status {}", status));
+        }
+    } 
+    // If we ARE the Worker process (env var is set), enter the VM!
+    else {
+        let ret = vm.start_enter();
+        if ret < 0 {
+            eprintln!("krun_start_enter failed: {}", ret);
+            return Err(format!("krun_start_enter failed: {}", ret));
+        }
+        return Ok(());
     }
 }
 
@@ -944,7 +1066,21 @@ fn configure_runtime_loader_env(runtime_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "windows")]
+fn configure_runtime_loader_env(runtime_dir: &Path) -> Result<(), String> {
+    let existing = std::env::var_os("PATH");
+    let mut paths = vec![runtime_dir.to_path_buf()];
+    if let Some(existing) = existing {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    let joined = std::env::join_paths(paths).map_err(|e| format!("join PATH: {e}"))?;
+    unsafe {
+        std::env::set_var("PATH", joined);
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn configure_runtime_loader_env(_runtime_dir: &Path) -> Result<(), String> {
     Ok(())
 }
@@ -1091,6 +1227,7 @@ impl VmContext {
         )
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn disable_implicit_vsock(&self) -> Result<(), String> {
         check(
             unsafe { (self.krun.krun_disable_implicit_vsock)(self.ctx_id) },
@@ -1098,6 +1235,7 @@ impl VmContext {
         )
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn add_vsock(&self, tsi_features: u32) -> Result<(), String> {
         check(
             unsafe { (self.krun.krun_add_vsock)(self.ctx_id, tsi_features) },
@@ -1137,12 +1275,13 @@ impl VmContext {
         features: u32,
     ) -> Result<(), String> {
         let sock_c = path_to_cstring(socket_path)?;
+        let invalid_socket = -1i32 as usize;
         check(
             unsafe {
                 (self.krun.krun_add_net_unixstream)(
                     self.ctx_id,
                     sock_c.as_ptr(),
-                    -1,
+                    invalid_socket as u64,
                     mac.as_ptr(),
                     features,
                     0,
@@ -1154,10 +1293,11 @@ impl VmContext {
 
     fn set_console_output(&self, path: &Path) -> Result<(), String> {
         let console_c = path_to_cstring(path)?;
-        check(
+        /* check(
             unsafe { (self.krun.krun_set_console_output)(self.ctx_id, console_c.as_ptr()) },
             "krun_set_console_output",
-        )
+        ) */
+       Ok(())
     }
 
     fn set_exec(&self, exec_path: &str, args: &[String], env: &[String]) -> Result<(), String> {
@@ -1301,6 +1441,7 @@ fn gvproxy_socket_base(overlay_disk: &Path) -> Result<PathBuf, String> {
 }
 
 fn install_signal_forwarding(pid: i32) {
+    #[cfg(not(target_os = "windows"))]
     unsafe {
         libc::signal(
             libc::SIGINT,
@@ -1324,6 +1465,7 @@ fn install_signal_forwarding(pid: i32) {
 /// Only async-signal-safe libc calls are used — `kill(2)` is listed in
 /// POSIX.1-2017 as async-signal-safe, atomic loads are lock-free on the
 /// platforms we target.
+#[cfg(not(target_os = "windows"))]
 extern "C" fn forward_signal(_sig: libc::c_int) {
     let vm_pid = CHILD_PID.load(Ordering::Relaxed);
     if vm_pid > 0 {
@@ -1340,6 +1482,7 @@ extern "C" fn forward_signal(_sig: libc::c_int) {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn wait_for_child(pid: i32) -> Result<libc::c_int, String> {
     let mut status: libc::c_int = 0;
     let rc = unsafe { libc::waitpid(pid, &raw mut status, 0) };
