@@ -5,16 +5,17 @@
 //!
 //! This module owns everything needed to hand the gateway a `Channel` speaking
 //! the `openshell.compute.v1.ComputeDriver` RPC surface against an
-//! `openshell-driver-vm` subprocess over a Unix domain socket:
+//! `openshell-driver-vm` subprocess over an authenticated local socket (a
+//! Unix domain socket on Unix, a named pipe on Windows):
 //!
 //! - [`VmComputeConfig`]: gateway-local configuration (state dir, driver binary,
 //!   VM shape, guest TLS material).
-//! - [`spawn`]: spawn the driver subprocess, wait for its UDS to be ready,
-//!   and return a live gRPC channel plus a [`ManagedDriverProcess`] handle
-//!   that will reap the subprocess and clean up the socket on drop.
+//! - [`spawn`]: spawn the driver subprocess, wait for its local socket to be
+//!   ready, and return a live gRPC channel plus a [`ManagedDriverProcess`]
+//!   handle that will reap the subprocess and clean up the socket on drop.
 //! - Helpers to resolve the driver binary, compute the socket path, and
-//!   validate guest TLS material when the gateway runs an `https://` control
-//!   plane.
+//! validate guest TLS material when the gateway runs an `https://` control
+//! plane.
 //!
 //! The VM-driver fields deliberately live here rather than in
 //! [`openshell_core::Config`] so the shared core stays free of driver-specific
@@ -25,38 +26,40 @@
 //! argv and then connects through the same public compute-driver RPC interface
 //! used by operator-managed external drivers.
 
-#[cfg(unix)]
 use hyper_util::rt::TokioIo;
-#[cfg(unix)]
 use openshell_core::proto::compute::v1::{
     GetCapabilitiesRequest, compute_driver_client::ComputeDriverClient,
 };
 use openshell_core::{Error, Result, UpstreamProxyConfig};
-#[cfg(unix)]
 use openshell_otel::TraceContextInterceptor;
 use openshell_server::AcquiredRemoteDriverEndpoint;
-#[cfg(unix)]
 use openshell_server::ManagedDriverProcess;
 use openshell_server::config_file::OtlpConfig;
 #[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::io::ErrorKind;
 #[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::path::PathBuf;
-#[cfg(unix)]
-use std::{io::ErrorKind, process::Stdio, sync::Arc, time::Duration};
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
 #[cfg(unix)]
 use tokio::net::UnixStream;
-#[cfg(unix)]
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::ClientOptions;
 use tokio::process::Command;
 use tonic::transport::Channel;
-#[cfg(unix)]
 use tonic::transport::Endpoint;
-#[cfg(unix)]
 use tower::service_fn;
 
+#[cfg(windows)]
+const DRIVER_BIN_NAME: &str = "openshell-driver-vm.exe";
+#[cfg(not(windows))]
 const DRIVER_BIN_NAME: &str = "openshell-driver-vm";
+#[cfg(unix)]
 const COMPUTE_DRIVER_SOCKET_RUN_DIR: &str = "run";
+#[cfg(unix)]
 const COMPUTE_DRIVER_SOCKET_NAME: &str = "compute-driver.sock";
 
 /// Configuration for launching and talking to the VM compute driver.
@@ -263,7 +266,6 @@ impl Default for VmComputeConfig {
     }
 }
 
-#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmGuestTlsPaths {
     pub ca: PathBuf,
@@ -345,11 +347,28 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 }
 
 /// Path of the Unix domain socket the driver will listen on.
+#[cfg(unix)]
 pub fn compute_driver_socket_path(vm_config: &VmComputeConfig) -> PathBuf {
     vm_config
         .state_dir
         .join(COMPUTE_DRIVER_SOCKET_RUN_DIR)
         .join(COMPUTE_DRIVER_SOCKET_NAME)
+}
+
+/// Named pipe the driver will listen on. Pipe names are machine-global, so
+/// derive a unique one from the gateway pid and a timestamp instead of the
+/// state dir; the driver claims it with `first_pipe_instance` to refuse
+/// squatters.
+#[cfg(windows)]
+pub fn compute_driver_socket_path(_vm_config: &VmComputeConfig) -> PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    PathBuf::from(format!(
+        r"\\.\pipe\openshell-vm-driver-{}-{unique}",
+        std::process::id()
+    ))
 }
 
 #[cfg(unix)]
@@ -367,6 +386,18 @@ fn prepare_compute_driver_socket_path(
     })?;
     prepare_private_socket_dir(parent, expected_uid)?;
     remove_stale_socket(socket_path, expected_uid)
+}
+
+/// Named pipes need no filesystem preparation; only make sure the driver's
+/// state directory exists for its disks and caches.
+#[cfg(windows)]
+fn prepare_compute_driver_socket_path(vm_config: &VmComputeConfig, _socket_path: &Path) -> Result<()> {
+    std::fs::create_dir_all(&vm_config.state_dir).map_err(|err| {
+        Error::execution(format!(
+            "failed to create vm driver state dir '{}': {err}",
+            vm_config.state_dir.display()
+        ))
+    })
 }
 
 #[cfg(unix)]
@@ -491,7 +522,6 @@ fn remove_stale_socket(socket_path: &Path, expected_uid: u32) -> Result<()> {
     })
 }
 
-#[cfg(unix)]
 pub fn compute_driver_guest_tls_paths(
     vm_config: &VmComputeConfig,
 ) -> Result<Option<VmGuestTlsPaths>> {
@@ -522,10 +552,10 @@ pub fn compute_driver_guest_tls_paths(
     Ok(Some(VmGuestTlsPaths { ca }))
 }
 
-/// Launch the VM compute-driver subprocess, wait for its UDS to come up,
-/// and return a gRPC `Channel` connected to it plus a process handle that
-/// kills the subprocess and removes the socket on drop.
-#[cfg(unix)]
+/// Launch the VM compute-driver subprocess, wait for its local socket (Unix
+/// domain socket on Unix, named pipe on Windows) to come up, and return a
+/// gRPC `Channel` connected to it plus a process handle that kills the
+/// subprocess and removes the socket on drop.
 pub async fn spawn(
     gateway_log_level: &str,
     gateway_name: &str,
@@ -616,7 +646,6 @@ fn validate_vm_sandbox_identity(config: &VmComputeConfig) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn append_vm_identity_args(command: &mut Command, config: &VmComputeConfig) {
     if let Some(uid) = config.sandbox_uid {
         command.arg("--sandbox-uid").arg(uid.to_string());
@@ -626,7 +655,6 @@ fn append_vm_identity_args(command: &mut Command, config: &VmComputeConfig) {
     }
 }
 
-#[cfg(unix)]
 fn append_vm_rootfs_tar_args(command: &mut Command, config: &VmComputeConfig) {
     if let Some(path) = config.rootfs_tar_staging_dir.as_ref() {
         command.arg("--rootfs-tar-staging-dir").arg(path);
@@ -638,7 +666,6 @@ fn append_vm_rootfs_tar_args(command: &mut Command, config: &VmComputeConfig) {
     }
 }
 
-#[cfg(unix)]
 fn append_vm_proxy_and_spiffe_args(command: &mut Command, config: &VmComputeConfig) {
     let proxy = &config.upstream_proxy;
     if let Some(url) = proxy.https_proxy.as_ref() {
@@ -688,19 +715,6 @@ fn append_otlp_args(command: &mut Command, otlp_config: Option<&OtlpConfig>, gat
     }
 }
 
-#[cfg(not(unix))]
-pub async fn spawn(
-    _gateway_log_level: &str,
-    _gateway_name: &str,
-    _vm_config: &VmComputeConfig,
-    _otlp_config: Option<&OtlpConfig>,
-) -> Result<AcquiredRemoteDriverEndpoint> {
-    Err(Error::config(
-        "the vm compute driver requires unix domain socket support",
-    ))
-}
-
-#[cfg(unix)]
 #[tracing::instrument(
     name = "driver.wait_for_ready",
     skip_all,
@@ -767,6 +781,24 @@ async fn connect_compute_driver(socket_path: &Path) -> Result<Channel> {
         .map_err(|e| {
             Error::execution(format!(
                 "failed to connect to vm compute driver socket '{}': {e}",
+                display_path.display()
+            ))
+        })
+}
+
+#[cfg(windows)]
+async fn connect_compute_driver(pipe_path: &Path) -> Result<Channel> {
+    let pipe_path = pipe_path.to_path_buf();
+    let display_path = pipe_path.clone();
+    Endpoint::from_static("http://[::]:50051")
+        .connect_with_connector(service_fn(move |_: tonic::transport::Uri| {
+            let pipe_path = pipe_path.clone();
+            async move { ClientOptions::new().open(&pipe_path).map(TokioIo::new) }
+        }))
+        .await
+        .map_err(|e| {
+            Error::execution(format!(
+                "failed to connect to vm compute driver pipe '{}': {e}",
                 display_path.display()
             ))
         })

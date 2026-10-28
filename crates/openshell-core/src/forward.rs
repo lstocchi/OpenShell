@@ -907,6 +907,7 @@ pub fn format_gateway_url(scheme: &str, host: &str, port: u16) -> String {
 }
 
 /// Shell-escape a value for use inside a `ProxyCommand` string.
+#[cfg(not(windows))]
 pub fn shell_escape(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
@@ -921,6 +922,25 @@ pub fn shell_escape(value: &str) -> String {
 
     let escaped = value.replace('\'', "'\"'\"'");
     format!("'{escaped}'")
+}
+
+/// Windows OpenSSH parses `ProxyCommand` with its own command-line rules
+/// rather than a POSIX shell: double-quote anything unsafe instead.
+#[cfg(windows)]
+pub fn shell_escape(value: &str) -> String {
+    if value.is_empty() {
+        return "\"\"".to_string();
+    }
+
+    let safe = value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'/' | b'-' | b'_'));
+    if safe {
+        return value.to_string();
+    }
+
+    let escaped = value.replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 /// Build the SSH `ProxyCommand` string used to tunnel to a sandbox.

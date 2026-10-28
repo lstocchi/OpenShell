@@ -6,10 +6,10 @@
 mod input;
 mod upload;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod exec_input_tests;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod upload_tests;
 
 #[cfg(test)]
@@ -31,6 +31,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(unix)]
 use tokio::net::UnixListener;
 use tracing::warn;
 
@@ -70,11 +71,24 @@ fn filter_main_detach_sequence(prefix_pending: &mut bool, data: &[u8]) -> (Vec<u
     (forward, false)
 }
 
+/// The transport the SSH server listens on: a Tokio Unix listener on Unix,
+/// the WinSock AF_UNIX bridge on Windows (tokio has no AF_UNIX there).
+#[cfg(unix)]
+type SshListener = UnixListener;
+#[cfg(windows)]
+type SshListener = openshell_core::winsock_unix::UnixListener;
+
+/// One accepted SSH connection stream.
+#[cfg(unix)]
+type SshStream = tokio::net::UnixStream;
+#[cfg(windows)]
+type SshStream = openshell_core::winsock_unix::UnixStream;
+
 /// Perform SSH server initialization: generate a host key, build the config,
-/// and bind the Unix socket listener. Extracted so that startup errors can be
+/// and bind the socket listener. Extracted so that startup errors can be
 /// forwarded through the readiness channel rather than being silently logged.
 type SshServerInit = (
-    UnixListener,
+    SshListener,
     Arc<russh::server::Config>,
     Option<Arc<(PathBuf, PathBuf)>>,
 );
@@ -100,6 +114,10 @@ fn ssh_server_init(
     shared_socket: bool,
     host_key: PrivateKey,
 ) -> Result<SshServerInit> {
+    // Windows has no mode bits; the containing directory carries the access
+    // restriction instead.
+    #[cfg(windows)]
+    let _ = shared_socket;
     let mut config = russh::server::Config {
         server_id: russh::SshId::Standard(Cow::Owned(format!("SSH-2.0-OpenShell_{VERSION}"))),
         auth_rejection_time: Duration::from_secs(1),
@@ -131,8 +149,17 @@ fn ssh_server_init(
     if !abstract_socket && listen_path.exists() {
         std::fs::remove_file(listen_path).into_diagnostic()?;
     }
-    let runtime_path = crate::unix_socket::runtime_path(listen_path);
-    let listener = UnixListener::bind(runtime_path.as_ref()).into_diagnostic()?;
+    #[cfg(unix)]
+    let listener = {
+        let runtime_path = crate::unix_socket::runtime_path(listen_path);
+        UnixListener::bind(runtime_path.as_ref()).into_diagnostic()?
+    };
+    // Windows has no abstract sockets and no mode bits: the driver places the
+    // socket inside a per-sandbox directory restricted to the driver's user.
+    #[cfg(windows)]
+    let listener = openshell_core::winsock_unix::UnixListener::bind(listen_path)
+        .into_diagnostic()
+        .map_err(|error| miette::miette!("bind SSH socket {}: {error}", listen_path.display()))?;
 
     // Tighten filesystem-socket permissions. Abstract sockets have no inode;
     // local relay connections authenticate the listener with SO_PEERCRED.
@@ -186,8 +213,14 @@ pub async fn run_ssh_server(
     let mut consecutive_resource_errors = 0;
     let mut consecutive_unknown_errors = 0;
     loop {
-        match listener.accept().await {
-            Ok((stream, _peer)) => {
+        // Both listener flavors yield one accepted stream per call; the
+        // Windows bridge reports accept failures with the same io::Error.
+        #[cfg(unix)]
+        let accepted = listener.accept().await.map(|(stream, _peer)| stream);
+        #[cfg(windows)]
+        let accepted = listener.accept().await;
+        match accepted {
+            Ok(stream) => {
                 consecutive_resource_errors = 0;
                 consecutive_unknown_errors = 0;
                 let config = config.clone();
@@ -260,6 +293,10 @@ fn classify_ssh_accept_error(
     consecutive_resource_errors: &mut u32,
     consecutive_unknown_errors: &mut u32,
 ) -> SshAcceptAction {
+    // Windows accept failures carry no stable errno classification; they all
+    // take the retry path below, which still reads `error` for the message.
+    #[cfg(windows)]
+    let _ = error;
     #[cfg(unix)]
     if matches!(
         error.raw_os_error(),
@@ -338,7 +375,7 @@ fn classify_ssh_accept_error(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
-    stream: tokio::net::UnixStream,
+    stream: SshStream,
     config: Arc<russh::server::Config>,
     port_forward: Arc<openshell_sandbox_backend::BoundaryLoopbackConnector>,
     boundary_exec: Arc<openshell_sandbox_backend::BoundaryExec>,
@@ -1543,8 +1580,10 @@ mod tests {
 
     pub(super) struct AcceptAnyServerKey;
 
+    #[cfg(unix)]
     struct PinnedServerKey(String);
 
+    #[cfg(unix)]
     impl russh::client::Handler for PinnedServerKey {
         type Error = russh::Error;
 

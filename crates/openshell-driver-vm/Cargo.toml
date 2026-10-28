@@ -29,11 +29,10 @@ openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
 openshell-otel = { path = "../openshell-otel", optional = true }
 openshell-policy = { path = "../openshell-policy", optional = true }
-openshell-driver-podman = { path = "../openshell-driver-podman", optional = true }
 openshell-vfio = { path = "../openshell-vfio", optional = true }
 
 base64 = { workspace = true, optional = true }
-bollard = { version = "0.20", features = ["ssh"], optional = true }
+bollard = { version = "0.20", optional = true }
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["transport"], optional = true }
 tower-http = { workspace = true, optional = true }
@@ -127,6 +126,22 @@ opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # syscall with no helper thread.
 [target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
 polling = { version = "3.11", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+# bollard's SSH transport pulls in the Unix-only `openssh` crate.
+[target.'cfg(unix)'.dependencies]
+bollard = { version = "0.20", features = ["ssh"], optional = true }
+openshell-driver-podman = { path = "../openshell-driver-podman", optional = true }
 
 [lints]
 workspace = true

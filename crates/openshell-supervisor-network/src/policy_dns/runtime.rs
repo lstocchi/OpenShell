@@ -307,6 +307,7 @@ impl Drop for PolicyDnsRuntime {
     }
 }
 
+#[cfg(unix)]
 fn trusted_resolver_from_resolv_conf() -> Result<SocketAddr> {
     let contents = std::fs::read_to_string("/etc/resolv.conf")
         .into_diagnostic()
@@ -327,6 +328,15 @@ fn trusted_resolver_from_resolv_conf() -> Result<SocketAddr> {
     Err(miette::miette!(
         "no literal nameserver is configured in supervisor /etc/resolv.conf"
     ))
+}
+
+/// Windows hosts have no `/etc/resolv.conf`; the first DNS server of the
+/// first operational adapter takes its place.
+#[cfg(windows)]
+fn trusted_resolver_from_resolv_conf() -> Result<SocketAddr> {
+    let resolver = openshell_core::windows_dns::system_resolver()
+        .map_err(|error| miette::miette!("failed to read trusted supervisor resolver configuration: {error}"))?;
+    Ok(SocketAddr::new(resolver, 53))
 }
 
 #[cfg(test)]

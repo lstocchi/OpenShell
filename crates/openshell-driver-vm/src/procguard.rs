@@ -80,6 +80,12 @@ where
         install_bsd_kqueue_watcher(cleanup)
     }
 
+    #[cfg(windows)]
+    {
+        let _ = cleanup;
+        install_windows_kill_on_close_job()
+    }
+
     #[cfg(not(any(
         target_os = "linux",
         target_os = "macos",
@@ -88,11 +94,62 @@ where
         target_os = "netbsd",
         target_os = "openbsd",
         target_os = "dragonfly",
+        windows,
     )))]
     {
         let _ = cleanup;
         Ok(())
     }
+}
+
+/// Windows has no parent-death signal. Put this process in a Job Object
+/// that kills every member when its last handle closes: the handle is
+/// intentionally leaked, so the job dies with this process and takes every
+/// descendant (launchers, VMs, preparation workers, ext4kit) with it.
+/// Nested jobs are supported, so each level of the process chain can arm it.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn install_windows_kill_on_close_job() -> Result<(), String> {
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    // SAFETY: plain Win32 calls on a job handle owned by this function and
+    // the pseudo-handle of the current process; the limit struct outlives
+    // the call that reads it.
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return Err(format!(
+                "CreateJobObjectW failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast(),
+            u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()).unwrap_or(u32::MAX),
+        ) == 0
+        {
+            return Err(format!(
+                "SetInformationJobObject failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if AssignProcessToJobObject(job, GetCurrentProcess()) == 0 {
+            return Err(format!(
+                "AssignProcessToJobObject failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

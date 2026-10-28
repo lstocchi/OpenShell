@@ -22,19 +22,21 @@ openshell-otel = { path = "../openshell-otel", optional = true }
 async-trait = "0.1"
 miette = { workspace = true }
 tokio = { workspace = true }
+# Shared with the Windows VM driver path; the Docker/Podman/Kubernetes
+# drivers and the Unix socket plumbing below stay Unix-only.
+openshell-policy = { path = "../openshell-policy", optional = true }
+hyper-util = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 openshell-driver-docker = { path = "../openshell-driver-docker", optional = true }
 openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes", optional = true }
 openshell-driver-podman = { path = "../openshell-driver-podman", optional = true }
-openshell-policy = { path = "../openshell-policy", optional = true }
-hyper-util = { workspace = true, optional = true }
 nix = { workspace = true, optional = true }
-serde = { workspace = true, optional = true }
 rustix = { workspace = true, optional = true }
-tonic = { workspace = true, optional = true }
-tower = { workspace = true, optional = true }
-tracing = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 openshell-driver-mxc = { path = "../openshell-driver-mxc", optional = true }
@@ -74,6 +76,7 @@ telemetry = ["openshell-core/telemetry", "openshell-server/telemetry"]
 ## `rust:verify:defaults-without-telemetry`.
 defaults-without-telemetry = ["in-tree-compute-drivers"]
 vendored-z3 = ["openshell-server/vendored-z3"]
+prebuilt-z3 = ["openshell-server/prebuilt-z3"]
 
 [lints]
 workspace = true

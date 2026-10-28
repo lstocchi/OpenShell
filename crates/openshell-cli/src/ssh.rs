@@ -213,8 +213,18 @@ async fn ssh_session_config(
     })
 }
 
+/// Resolve the system Windows OpenSSH client, falling back to a bare `ssh`
+/// PATH lookup when it is not installed.
+#[cfg(windows)]
+fn system_openssh_binary() -> std::path::PathBuf {
+    let system_root = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    let candidate = system_root.join("System32").join("OpenSSH").join("ssh.exe");
+    candidate.is_file().then_some(candidate).unwrap_or_else(|| "ssh".into())
+}
+
 fn ssh_base_command(proxy_command: &str) -> Command {
-    // An explicit environment override wins over the CLI verbosity default.
     let ssh_log_level = std::env::var("OPENSHELL_SSH_LOG_LEVEL").unwrap_or_else(|_| {
         DEFAULT_SSH_LOG_LEVEL
             .get()
@@ -223,6 +233,12 @@ fn ssh_base_command(proxy_command: &str) -> Command {
             .to_string()
     });
 
+/*     // Windows OpenSSH parses ProxyCommand with command-line rules, not a
+    // POSIX shell; an MSYS ssh from a Git installation on PATH would run it
+    // through /bin/sh instead and fail. Prefer the system OpenSSH explicitly.
+    #[cfg(windows)]
+    let mut command = Command::new(system_openssh_binary());
+    #[cfg(not(windows))] */
     let mut command = Command::new("ssh");
     // Nested ProxyCommand processes inherit the effective verbosity too.
     command.env("OPENSHELL_SSH_LOG_LEVEL", &ssh_log_level);

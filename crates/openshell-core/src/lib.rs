@@ -66,6 +66,10 @@ pub mod time;
 pub mod token_grant_failure;
 pub mod transport_errors;
 pub mod upload;
+#[cfg(windows)]
+pub mod winsock_unix;
+#[cfg(windows)]
+pub mod windows_dns;
 
 pub use config::{
     AppArmorProfile, Config, GatewayAuthConfig, GatewayInterceptorBindingOverride,

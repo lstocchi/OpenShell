@@ -826,12 +826,14 @@ pub async fn report_main_process_exit(
     Ok(())
 }
 
-#[cfg(all(test, unix))]
-pub(crate) async fn test_bridge_ssh_relay(
-    target: tokio::net::UnixStream,
+#[cfg(test)]
+pub(crate) async fn test_bridge_ssh_relay<S>(
+    target: S,
     inbound: mpsc::Receiver<Result<RelayFrame, tonic::Status>>,
     out_tx: mpsc::Sender<RelayFrame>,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
     let _ = bridge_relay(
         Box::new(target),
         tokio_stream::wrappers::ReceiverStream::new(inbound),
@@ -1172,16 +1174,22 @@ async fn open_target(
     port_forward: &Arc<BoundaryLoopbackConnector>,
     expected_ssh_peer_pid: Option<u32>,
 ) -> Result<Box<dyn TargetStream>, Box<dyn std::error::Error + Send + Sync>> {
-    #[cfg(not(unix))]
-    let _ = (ssh_socket_path, expected_ssh_peer_pid);
+    // The WinSock AF_UNIX bridge exposes no peer credentials to check.
+    #[cfg(windows)]
+    let _ = expected_ssh_peer_pid;
     match relay_open.target.as_ref() {
         Some(relay_open::Target::Tcp(target)) => open_tcp_target(target, port_forward).await,
         Some(relay_open::Target::Ssh(_)) | None => {
             if ssh_socket_path.as_os_str().is_empty() {
                 return Err("SSH access is not configured for this supervisor".into());
             }
-            #[cfg(not(unix))]
-            return Err("SSH relay targets are unsupported by the Windows supervisor".into());
+            #[cfg(windows)]
+            {
+                // The WinSock AF_UNIX bridge has no SO_PEERCRED; the driver
+                // restricts the containing directory to the driver user.
+                let stream = openshell_core::winsock_unix::connect(ssh_socket_path).await?;
+                Ok(Box::new(stream))
+            }
             #[cfg(unix)]
             {
                 let runtime_path = crate::unix_socket::runtime_path(ssh_socket_path);

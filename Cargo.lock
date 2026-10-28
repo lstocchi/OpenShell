@@ -4391,6 +4391,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "socket2",
  "tar",
  "tempfile",
  "thiserror 2.0.20",
@@ -4405,6 +4406,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
@@ -4677,6 +4679,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 

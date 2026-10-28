@@ -23,6 +23,8 @@ fn main() {
             "libkrunfw.so.5.zst",
             "libkrun.dylib.zst",
             "libkrunfw.5.dylib.zst",
+            "libkrun.dll.zst",
+            "libkrunfw.dll.zst",
             "openshell-sandbox.zst",
             "openshell-supervisor.zst",
             "openshell-vm-init.zst",
@@ -39,6 +41,7 @@ fn main() {
     let (libkrun_name, libkrunfw_name) = match target_os.as_str() {
         "macos" => ("libkrun.dylib", "libkrunfw.5.dylib"),
         "linux" => ("libkrun.so", "libkrunfw.so.5"),
+        "windows" => ("libkrun.dll", "libkrunfw.dll"),
         _ => {
             println!("cargo:warning=VM runtime not available for {target_os}-{target_arch}");
             generate_stub_resources(

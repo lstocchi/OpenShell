@@ -30,10 +30,19 @@ mod resources {
     pub const LIBKRUNFW_NAME: &str = "libkrunfw.so.5";
 }
 
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+mod resources {
+    pub const LIBKRUN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libkrun.dll.zst"));
+    pub const LIBKRUNFW: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libkrunfw.dll.zst"));
+    pub const LIBKRUN_NAME: &str = "libkrun.dll";
+    pub const LIBKRUNFW_NAME: &str = "libkrunfw.dll";
+}
+
 #[cfg(not(any(
     all(target_os = "macos", target_arch = "aarch64"),
     all(target_os = "linux", target_arch = "aarch64"),
     all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "windows", target_arch = "x86_64"),
 )))]
 mod resources {
     pub const LIBKRUN: &[u8] = &[];

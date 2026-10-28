@@ -206,6 +206,7 @@ _build/
 
 # Gateway microVM rootfs build artifacts
 rootfs/
+!crates/openshell-driver-vm/src/rootfs/
 
 # Docker build artifacts (image tarballs, packaged helm charts)
 deploy/docker/.build/

@@ -47,6 +47,18 @@ openshell-otel = { path = "../openshell-otel", optional = true }
 nix = { workspace = true }
 rustix = { workspace = true }
 
+# WinSock AF_UNIX listener for guest-initiated connections proxied by
+# libkrun's Windows port; see `winsock_unix`.
+[target.'cfg(windows)'.dependencies]
+socket2 = { workspace = true }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_System_SystemInformation",
+] }
+
 [features]
 default = ["telemetry"]
 ## Compile in anonymous telemetry emission support. On by default; disable with

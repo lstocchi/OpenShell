@@ -2,7 +2,7 @@
 
 > Status: Experimental. The VM compute driver is under active development.
 
-Standalone libkrun-backed [`ComputeDriver`](../../proto/compute_driver.proto) for OpenShell. The gateway spawns this binary as a subprocess and talks to it over the `openshell.compute.v1.ComputeDriver` Unix-socket surface. `openshell-supervisor` runs as a native host process, while `openshell-sandbox` runs as capability-free PID 1 inside each microVM and applies guest-local isolation over virtio-vsock.
+Standalone libkrun-backed [`ComputeDriver`](../../proto/compute_driver.proto) for OpenShell. The gateway spawns this binary as a subprocess and talks to it over the `openshell.compute.v1.ComputeDriver` Unix-socket surface (a Win32 named pipe on Windows, where tokio and std do not provide AF_UNIX). `openshell-supervisor` runs as a native host process, while `openshell-sandbox` runs as capability-free PID 1 inside each microVM and applies guest-local isolation over virtio-vsock.
 
 New VM generations initiate the control connection to host CID 2 over vsock.
 Libkrun forwards that guest connection to the supervisor's protected Unix
@@ -295,9 +295,13 @@ create TAP devices or install nftables/iptables rules.
 
 ## Prerequisites
 
-- macOS on Apple Silicon, or Linux on aarch64/x86_64 with KVM
+- macOS on Apple Silicon, Linux on aarch64/x86_64 with KVM or Windows x86_64 with WHP
 - Rust toolchain
-- e2fsprogs (`mke2fs` or `mkfs.ext4`, plus `debugfs`) for root and overlay disk image creation and QEMU environment injection
+- e2fsprogs (`mke2fs` or `mkfs.ext4`, plus `debugfs`) for root and overlay disk image creation and QEMU environment injection on macOS/Linux
+- on Windows, [ext4kit](https://github.com/rh-dev/ext4kit) on `PATH` (or pointed at by
+  `OPENSHELL_VM_EXT4KIT`) fills the e2fsprogs role, and `OPENSHELL_VM_RUNTIME_DIR`
+  must point at a directory containing `krun.dll`, `libkrunfw.dll` and `krun-init`
+  (the runtime is not embedded yet)
 - Guest-sandbox cross-compile toolchain (needed on macOS, and on Linux when host arch differs from the guest):
   - Matching static guest target: `rustup target add aarch64-unknown-linux-musl` (or `x86_64-unknown-linux-musl` for an amd64 guest)
   - `cargo install --locked cargo-zigbuild` and `brew install zig` (or distro equivalent). `vm:supervisor` cross-compiles the Linux guest `openshell-sandbox` and its matching `openshell-supervisor`.

@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs;
+#[cfg(unix)]
 use std::io::Write as _;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt as _;
@@ -704,6 +705,7 @@ impl LayerApplier {
     }
 
     #[cfg(not(unix))]
+    #[allow(clippy::unused_self)]
     fn copy_symlink(&self, _source_path: &Path, _dest_path: &Path) -> Result<(), String> {
         Err("symlink layers are only supported on Unix hosts".to_string())
     }

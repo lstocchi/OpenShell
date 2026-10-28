@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Minimal runtime-loaded bindings for the libkrun C API used by the VM driver.
+//! Runtime-loaded bindings for the libkrun 1.x context API used on Unix.
 
 #![allow(unsafe_code)]
 
@@ -12,17 +12,10 @@ use std::sync::OnceLock;
 use libc::c_char;
 use libloading::Library;
 
+use super::load_symbol;
 use crate::runtime::validate_runtime_dir;
 
 pub const KRUN_LOG_TARGET_DEFAULT: i32 = -1;
-pub const KRUN_LOG_LEVEL_OFF: u32 = 0;
-pub const KRUN_LOG_LEVEL_ERROR: u32 = 1;
-pub const KRUN_LOG_LEVEL_WARN: u32 = 2;
-pub const KRUN_LOG_LEVEL_INFO: u32 = 3;
-pub const KRUN_LOG_LEVEL_DEBUG: u32 = 4;
-pub const KRUN_LOG_LEVEL_TRACE: u32 = 5;
-pub const KRUN_LOG_STYLE_AUTO: u32 = 0;
-pub const KRUN_LOG_OPTION_NO_ENV: u32 = 1;
 
 type KrunInitLog =
     unsafe extern "C" fn(target_fd: i32, level: u32, style: u32, options: u32) -> i32;
@@ -120,32 +113,32 @@ impl LibKrun {
         }));
 
         Ok(Self {
-            krun_init_log: load_symbol(library, b"krun_init_log\0", &libkrun_path)?,
-            krun_create_ctx: load_symbol(library, b"krun_create_ctx\0", &libkrun_path)?,
-            krun_free_ctx: load_symbol(library, b"krun_free_ctx\0", &libkrun_path)?,
-            krun_set_vm_config: load_symbol(library, b"krun_set_vm_config\0", &libkrun_path)?,
-            krun_add_disk: load_symbol(library, b"krun_add_disk\0", &libkrun_path)?,
+            krun_init_log: load_symbol(library, "krun_init_log", &libkrun_path)?,
+            krun_create_ctx: load_symbol(library, "krun_create_ctx", &libkrun_path)?,
+            krun_free_ctx: load_symbol(library, "krun_free_ctx", &libkrun_path)?,
+            krun_set_vm_config: load_symbol(library, "krun_set_vm_config", &libkrun_path)?,
+            krun_add_disk: load_symbol(library, "krun_add_disk", &libkrun_path)?,
             krun_set_root_disk_remount: load_symbol(
                 library,
-                b"krun_set_root_disk_remount\0",
+                "krun_set_root_disk_remount",
                 &libkrun_path,
             )?,
-            krun_set_workdir: load_symbol(library, b"krun_set_workdir\0", &libkrun_path)?,
-            krun_set_exec: load_symbol(library, b"krun_set_exec\0", &libkrun_path)?,
+            krun_set_workdir: load_symbol(library, "krun_set_workdir", &libkrun_path)?,
+            krun_set_exec: load_symbol(library, "krun_set_exec", &libkrun_path)?,
             krun_set_console_output: load_symbol(
                 library,
-                b"krun_set_console_output\0",
+                "krun_set_console_output",
                 &libkrun_path,
             )?,
-            krun_start_enter: load_symbol(library, b"krun_start_enter\0", &libkrun_path)?,
+            krun_start_enter: load_symbol(library, "krun_start_enter", &libkrun_path)?,
             krun_disable_implicit_vsock: load_symbol(
                 library,
-                b"krun_disable_implicit_vsock\0",
+                "krun_disable_implicit_vsock",
                 &libkrun_path,
             )?,
-            krun_add_vsock: load_symbol(library, b"krun_add_vsock\0", &libkrun_path)?,
-            krun_add_vsock_port2: load_symbol(library, b"krun_add_vsock_port2\0", &libkrun_path)?,
-            krun_add_virtiofs4: load_symbol(library, b"krun_add_virtiofs4\0", &libkrun_path),
+            krun_add_vsock: load_symbol(library, "krun_add_vsock", &libkrun_path)?,
+            krun_add_vsock_port2: load_symbol(library, "krun_add_vsock_port2", &libkrun_path)?,
+            krun_add_virtiofs4: load_symbol(library, "krun_add_virtiofs4", &libkrun_path),
         })
     }
 }
@@ -199,16 +192,4 @@ fn preload_runtime_support_libraries(runtime_dir: &Path) -> Result<Vec<PathBuf>,
     }
 
     Ok(support_libs)
-}
-
-fn load_symbol<T: Copy>(library: &'static Library, name: &[u8], path: &Path) -> Result<T, String> {
-    unsafe {
-        library.get::<T>(name).map(|symbol| *symbol).map_err(|e| {
-            format!(
-                "load symbol {} from {}: {e}",
-                String::from_utf8_lossy(name).trim_end_matches('\0'),
-                path.display()
-            )
-        })
-    }
 }

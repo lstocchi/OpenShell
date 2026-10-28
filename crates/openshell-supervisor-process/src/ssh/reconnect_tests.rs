@@ -124,7 +124,10 @@ impl Connection {
         let config_mut = Arc::get_mut(&mut config).unwrap();
         config_mut.keepalive_interval = config_mut.keepalive_interval.map(|_| TEST_INTERVAL);
         let server_task = tokio::spawn(async move {
+            #[cfg(unix)]
             let (stream, _) = listener.accept().await.unwrap();
+            #[cfg(windows)]
+            let stream = listener.accept().await.unwrap();
             let _ = handle_connection(
                 stream,
                 config,
@@ -135,7 +138,12 @@ impl Connection {
             )
             .await;
         });
+        #[cfg(unix)]
         let target = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        #[cfg(windows)]
+        let target = openshell_core::winsock_unix::connect(&socket)
+            .await
+            .unwrap();
         let (to_supervisor, inbound) = mpsc::channel(16);
         let (outbound, mut from_supervisor) = mpsc::channel::<RelayFrame>(16);
         let relay = tokio::spawn(crate::supervisor_session::test_bridge_ssh_relay(

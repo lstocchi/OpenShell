@@ -6,19 +6,43 @@ use futures::Stream;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+#[cfg(windows)]
+use openshell_driver_vm::driver::{
+    LocalAllocGuard, current_process_user_sid_string, current_user_security_descriptor,
+    process_user_sid_string,
+};
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
 use openshell_driver_vm::{
     VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, VmMount, VsockPortMap, procguard, run_vm,
 };
+#[cfg(windows)]
+use std::ffi::c_void;
+#[cfg(windows)]
+use std::future::Future;
 use std::io;
+#[cfg(windows)]
+use std::mem::size_of;
 use std::net::SocketAddr;
+#[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle as _;
+use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+#[cfg(windows)]
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tracing::info;
+#[cfg(windows)]
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+#[cfg(windows)]
+use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
 
 #[derive(Parser, Debug)]
 #[command(name = "openshell-driver-vm")]
@@ -74,6 +98,8 @@ struct Args {
     #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_BIND")]
     bind_address: Option<SocketAddr>,
 
+    /// Authenticated local listen socket. A Unix domain socket path on Unix; a
+    /// named pipe path like \\.\pipe\openshell-vm-driver-<id> on Windows.
     #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
     bind_socket: Option<PathBuf>,
 
@@ -268,6 +294,10 @@ struct Args {
 
     #[arg(long, hide = true)]
     vm_mount: Vec<String>,
+
+    /// Extra guest argument after `--vm-exec` (repeatable).
+    #[arg(long, hide = true, allow_hyphen_values = true)]
+    vm_arg: Vec<String>,
 }
 
 #[tokio::main]
@@ -364,6 +394,26 @@ async fn main() -> Result<()> {
 
     let socket_cleanup = driver.clone();
     let result = match listen_mode {
+        // Windows has no tokio/std AF_UNIX support, so the authenticated local
+        // listen mode maps `--bind-socket` onto a Win32 named pipe. Peer
+        // identity comes from GetNamedPipeClientProcessId instead of
+        // SO_PEERCRED; see `AuthenticatedNamedPipeIncoming`.
+        #[cfg(windows)]
+        ComputeDriverListenMode::Unix {
+            socket_path,
+            expected_peer_pid,
+        } => {
+            info!(pipe = %socket_path.display(), "Starting vm compute driver");
+            let incoming = AuthenticatedNamedPipeIncoming::new(socket_path, expected_peer_pid)
+                .into_diagnostic()?;
+            tonic::transport::Server::builder()
+                .layer(openshell_otel::compute_driver_rpc_layer())
+                .add_service(ComputeDriverServer::new(driver))
+                .serve_with_incoming_shutdown(incoming, shutdown_signal())
+                .await
+                .into_diagnostic()
+        }
+        #[cfg(unix)]
         ComputeDriverListenMode::Unix {
             socket_path,
             expected_peer_pid,
@@ -399,6 +449,31 @@ async fn main() -> Result<()> {
     result
 }
 
+#[cfg(windows)]
+async fn shutdown_signal() {
+    use tokio::signal::windows;
+
+    let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
+    let mut ctrl_close = windows::ctrl_close().expect("install ctrl_close handler");
+    let mut ctrl_shutdown = windows::ctrl_shutdown().expect("install ctrl_shutdown handler");
+
+    tokio::select! {
+        result = &mut ctrl_c => {
+            if let Err(error) = result {
+                tracing::warn!(%error, "failed to listen for Ctrl-C");
+            }
+        }
+        _ = ctrl_close.recv() => {
+            info!("Console window close signal received");
+        }
+        _ = ctrl_shutdown.recv() => {
+            info!("OS shutdown signal received");
+        }
+    }
+    info!("Shutdown signal received; stopping vm compute driver");
+}
+
+#[cfg(unix)]
 async fn shutdown_signal() {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("install SIGTERM handler");
@@ -430,6 +505,8 @@ fn compute_driver_listen_mode(args: &Args) -> std::result::Result<ComputeDriverL
                     .to_string(),
             );
         }
+        #[cfg(windows)]
+        validate_named_pipe_path(&socket_path)?;
         return Ok(ComputeDriverListenMode::Unix {
             socket_path,
             expected_peer_pid: args.expected_peer_pid,
@@ -450,6 +527,7 @@ fn compute_driver_listen_mode(args: &Args) -> std::result::Result<ComputeDriverL
     Ok(ComputeDriverListenMode::Tcp(bind_address))
 }
 
+#[cfg(unix)]
 fn prepare_compute_driver_socket(socket_path: &Path) -> std::result::Result<(), String> {
     let Some(parent) = socket_path.parent() else {
         return Err(format!(
@@ -462,10 +540,12 @@ fn prepare_compute_driver_socket(socket_path: &Path) -> std::result::Result<(), 
     remove_stale_socket(socket_path, expected_uid)
 }
 
+#[cfg(unix)]
 fn current_euid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
+#[cfg(unix)]
 fn prepare_private_socket_dir(
     socket_dir: &Path,
     expected_uid: u32,
@@ -499,6 +579,7 @@ fn prepare_private_socket_dir(
         .map_err(|err| format!("chmod socket dir {}: {err}", socket_dir.display()))
 }
 
+#[cfg(unix)]
 fn remove_stale_socket(socket_path: &Path, expected_uid: u32) -> std::result::Result<(), String> {
     let metadata = match std::fs::symlink_metadata(socket_path) {
         Ok(metadata) => metadata,
@@ -530,17 +611,20 @@ fn remove_stale_socket(socket_path: &Path, expected_uid: u32) -> std::result::Re
         .map_err(|err| format!("remove stale socket {}: {err}", socket_path.display()))
 }
 
+#[cfg(unix)]
 fn restrict_socket_permissions(socket_path: &Path) -> std::result::Result<(), String> {
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
         .map_err(|err| format!("chmod socket {}: {err}", socket_path.display()))
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PeerCredentials {
     uid: u32,
     pid: Option<i32>,
 }
 
+#[cfg(unix)]
 fn peer_credentials(stream: &UnixStream) -> std::result::Result<PeerCredentials, String> {
     let credentials = stream
         .peer_cred()
@@ -551,6 +635,7 @@ fn peer_credentials(stream: &UnixStream) -> std::result::Result<PeerCredentials,
     })
 }
 
+#[cfg(unix)]
 fn authorize_peer_credentials(
     peer: PeerCredentials,
     driver_uid: u32,
@@ -578,12 +663,14 @@ fn authorize_peer_credentials(
     Ok(())
 }
 
+#[cfg(unix)]
 struct AuthenticatedUnixIncoming {
     listener: UnixListener,
     expected_uid: u32,
     expected_peer_pid: Option<u32>,
 }
 
+#[cfg(unix)]
 impl AuthenticatedUnixIncoming {
     fn new(listener: UnixListener, expected_peer_pid: Option<u32>) -> Self {
         Self {
@@ -594,6 +681,7 @@ impl AuthenticatedUnixIncoming {
     }
 }
 
+#[cfg(unix)]
 impl Stream for AuthenticatedUnixIncoming {
     type Item = io::Result<UnixStream>;
 
@@ -620,6 +708,254 @@ impl Stream for AuthenticatedUnixIncoming {
             }
         }
     }
+}
+
+/// Named pipe paths accepted by `--bind-socket` on Windows; `CreateNamedPipe`
+/// rejects anything longer.
+#[cfg(windows)]
+const MAX_NAMED_PIPE_PATH_LEN: usize = 256;
+
+#[cfg(windows)]
+fn validate_named_pipe_path(socket_path: &Path) -> std::result::Result<(), String> {
+    let text = socket_path.to_str().ok_or_else(|| {
+        format!(
+            "--bind-socket path '{}' is not valid UTF-8",
+            socket_path.display()
+        )
+    })?;
+    if !text.to_ascii_lowercase().starts_with(r"\\.\pipe\") {
+        return Err(format!(
+            "--bind-socket on Windows must be a named pipe path like \\\\.\\pipe\\openshell-vm-driver-<id> (got '{}')",
+            socket_path.display()
+        ));
+    }
+    if text.len() > MAX_NAMED_PIPE_PATH_LEN {
+        return Err(format!(
+            "--bind-socket named pipe path '{}' is longer than {MAX_NAMED_PIPE_PATH_LEN} characters",
+            socket_path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Owner-only DACL for the named pipe, the Windows equivalent of the Unix
+/// socket's `chmod 0600`: the kernel rejects any client running as another
+/// local user at `CreateFile` time, before the accept loop ever wakes up.
+/// Remote (SMB) clients are separately blocked by tokio's default
+/// `PIPE_REJECT_REMOTE_CLIENTS` pipe mode.
+#[cfg(windows)]
+struct NamedPipeSecurity {
+    /// Keeps the descriptor allocation alive; `attributes` points into it.
+    _descriptor: LocalAllocGuard,
+    attributes: SECURITY_ATTRIBUTES,
+}
+
+#[cfg(windows)]
+impl NamedPipeSecurity {
+    fn current_user() -> io::Result<Box<Self>> {
+        let descriptor = current_user_security_descriptor()?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(u32::MAX),
+            lpSecurityDescriptor: descriptor.as_ptr(),
+            bInheritHandle: 0,
+        };
+        Ok(Box::new(Self {
+            _descriptor: descriptor,
+            attributes,
+        }))
+    }
+}
+
+/// Accept loop for the Windows named-pipe listen mode.
+///
+/// Named pipes have no `SO_PEERCRED`; the pipe is created with an owner-only
+/// DACL so the kernel only lets same-user clients connect at all, and each
+/// accepted client is then checked with `GetNamedPipeClientProcessId`. With
+/// `--expected-peer-pid` the client PID must match the gateway; with
+/// `--allow-same-uid-peer` the client process must run under the same user
+/// SID as the driver. The user-space SID check is defense in depth on top of
+/// the DACL: it cannot be bypassed through PID reuse, because a recycled PID
+/// resolving to our own user already passes the DACL, and one resolving to
+/// any other user fails the check.
+#[cfg(windows)]
+struct AuthenticatedNamedPipeIncoming {
+    pipe_path: PathBuf,
+    expected_peer_pid: Option<u32>,
+    /// Only the first instance may claim `FILE_FLAG_FIRST_PIPE_INSTANCE`;
+    /// every later instance reuses the already-claimed pipe name.
+    first_instance: bool,
+    /// Boxed so the address stays stable for the raw pointer handed to
+    /// `create_with_security_attributes_raw`.
+    security: Box<NamedPipeSecurity>,
+    pending_connect: Option<Pin<Box<dyn Future<Output = io::Result<NamedPipeServer>> + Send>>>,
+}
+
+#[cfg(windows)]
+impl AuthenticatedNamedPipeIncoming {
+    fn new(pipe_path: PathBuf, expected_peer_pid: Option<u32>) -> io::Result<Self> {
+        Ok(Self {
+            pipe_path,
+            expected_peer_pid,
+            first_instance: true,
+            security: NamedPipeSecurity::current_user()?,
+            pending_connect: None,
+        })
+    }
+}
+
+/// Newtype giving the tokio named-pipe server the `Connected` marker tonic
+/// requires of transport streams; the pipe carries no socket address.
+#[cfg(windows)]
+struct NamedPipeIo(NamedPipeServer);
+
+#[cfg(windows)]
+impl AsyncRead for NamedPipeIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+#[cfg(windows)]
+impl AsyncWrite for NamedPipeIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+#[cfg(windows)]
+impl tonic::transport::server::Connected for NamedPipeIo {
+    type ConnectInfo = ();
+
+    fn connect_info(&self) -> Self::ConnectInfo {}
+}
+
+/// Raw pointer to the owner-only [`SECURITY_ATTRIBUTES`]. `Send` is sound
+/// because the boxed `NamedPipeSecurity` owning the allocation outlives every
+/// future carrying this wrapper, and the pointer is only dereferenced during
+/// the synchronous pipe-instance creation.
+#[cfg(windows)]
+struct RawSecurityAttributes(*const SECURITY_ATTRIBUTES);
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+unsafe impl Send for RawSecurityAttributes {}
+
+/// Create one named-pipe server instance restricted by the owner-only DACL.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn create_named_pipe_instance(
+    options: &ServerOptions,
+    pipe_path: &Path,
+    security_attributes: RawSecurityAttributes,
+) -> io::Result<NamedPipeServer> {
+    // SAFETY: `security_attributes` points into the boxed `NamedPipeSecurity`
+    // owned by the `AuthenticatedNamedPipeIncoming` that built the calling
+    // future, which outlives this synchronous call; `pipe_path` is a valid
+    // path for the duration of the borrow.
+    unsafe {
+        options.create_with_security_attributes_raw(pipe_path, security_attributes.0 as *mut c_void)
+    }
+}
+
+#[cfg(windows)]
+impl Stream for AuthenticatedNamedPipeIncoming {
+    type Item = io::Result<NamedPipeIo>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            if self.pending_connect.is_none() {
+                let pipe_path = self.pipe_path.clone();
+                let first_instance = self.first_instance;
+                let security_attributes =
+                    RawSecurityAttributes(&raw const self.security.attributes);
+                self.pending_connect = Some(Box::pin(async move {
+                    let mut options = ServerOptions::new();
+                    options.first_pipe_instance(first_instance);
+                    let server =
+                        create_named_pipe_instance(&options, &pipe_path, security_attributes)?;
+                    server.connect().await?;
+                    Ok(server)
+                }));
+            }
+            let pending = self
+                .pending_connect
+                .as_mut()
+                .expect("connect future is set above");
+            match pending.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(err)) => {
+                    self.pending_connect = None;
+                    return Poll::Ready(Some(Err(err)));
+                }
+                Poll::Ready(Ok(server)) => {
+                    self.pending_connect = None;
+                    self.first_instance = false;
+                    match authorize_named_pipe_client(&server, self.expected_peer_pid) {
+                        Ok(()) => return Poll::Ready(Some(Ok(NamedPipeIo(server)))),
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "rejected vm compute driver named pipe client"
+                            );
+                            // Dropping the server disconnects the rejected
+                            // client; loop to listen on a fresh instance.
+                            drop(server);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn authorize_named_pipe_client(
+    server: &NamedPipeServer,
+    expected_peer_pid: Option<u32>,
+) -> std::result::Result<(), String> {
+    let mut client_pid = 0u32;
+    if unsafe { GetNamedPipeClientProcessId(server.as_raw_handle(), &raw mut client_pid) } == 0 {
+        return Err(format!(
+            "failed to read named pipe client pid: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    if let Some(expected) = expected_peer_pid {
+        if client_pid != expected {
+            return Err(format!(
+                "named pipe client pid {client_pid} does not match expected gateway pid {expected}"
+            ));
+        }
+        return Ok(());
+    }
+    // --allow-same-uid-peer dev mode: accept only clients running as the same user.
+    let client_user = process_user_sid_string(client_pid)
+        .map_err(|err| format!("failed to read named pipe client user: {err}"))?;
+    let own_user = current_process_user_sid_string()
+        .map_err(|err| format!("failed to read current process user: {err}"))?;
+    if client_user != own_user {
+        return Err(format!(
+            "named pipe client user {client_user} does not match current user {own_user}"
+        ));
+    }
+    Ok(())
 }
 
 fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, String> {
@@ -661,7 +997,7 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         vcpus: args.vm_vcpus,
         mem_mib: args.vm_mem_mib,
         exec_path,
-        args: Vec::new(),
+        args: args.vm_arg.clone(),
         env: args.vm_env.clone(),
         workdir: args.vm_workdir.clone(),
         log_level: args.vm_krun_log_level,
@@ -771,7 +1107,7 @@ fn maybe_reexec_internal_vm_with_runtime_env() -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::{
         Args, ComputeDriverListenMode, PeerCredentials, authorize_peer_credentials,
@@ -1048,5 +1384,59 @@ mod tests {
     fn parse_vm_mount_arg_rejects_missing_fields() {
         assert!(parse_vm_mount_arg("/host/src\tosfs0").is_err());
         assert!(parse_vm_mount_arg("/host/src").is_err());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::{Args, ComputeDriverListenMode, compute_driver_listen_mode};
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    #[test]
+    fn listen_mode_accepts_named_pipe_with_expected_peer_pid() {
+        let args = Args::parse_from([
+            "openshell-driver-vm",
+            "--bind-socket",
+            r"\\.\pipe\openshell-vm-driver-1a2b",
+            "--expected-peer-pid",
+            "42",
+        ]);
+        assert_eq!(
+            compute_driver_listen_mode(&args).unwrap(),
+            ComputeDriverListenMode::Unix {
+                socket_path: PathBuf::from(r"\\.\pipe\openshell-vm-driver-1a2b"),
+                expected_peer_pid: Some(42),
+            }
+        );
+    }
+
+    #[test]
+    fn listen_mode_rejects_filesystem_socket_path() {
+        let args = Args::parse_from([
+            "openshell-driver-vm",
+            "--bind-socket",
+            r"C:\temp\compute-driver.sock",
+            "--expected-peer-pid",
+            "42",
+        ]);
+        let err = compute_driver_listen_mode(&args)
+            .expect_err("filesystem paths must be rejected on Windows");
+        assert!(err.contains("named pipe path"));
+    }
+
+    #[test]
+    fn listen_mode_rejects_overlong_pipe_path() {
+        let long_name = "a".repeat(300);
+        let args = Args::parse_from([
+            "openshell-driver-vm",
+            "--bind-socket",
+            &format!(r"\\.\pipe\{long_name}"),
+            "--expected-peer-pid",
+            "42",
+        ]);
+        let err =
+            compute_driver_listen_mode(&args).expect_err("overlong pipe names must be rejected");
+        assert!(err.contains("longer than"));
     }
 }

@@ -3,20 +3,28 @@
 
 #![allow(unsafe_code)]
 
+#[cfg(unix)]
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Command as StdCommand, Stdio};
+#[cfg(unix)]
 use std::ptr;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicI32, Ordering};
+#[cfg(unix)]
 use std::time::Duration;
 
-use crate::{embedded_runtime, ffi, procguard, rootfs};
+use crate::{embedded_runtime, ffi};
+#[cfg(unix)]
+use crate::{procguard, rootfs};
 
 pub const VM_RUNTIME_DIR_ENV: &str = "OPENSHELL_VM_RUNTIME_DIR";
 const KRUN_INIT_PID1_ENV: &str = "KRUN_INIT_PID1=1";
 
 /// PID of the VM worker process (libkrun fork or QEMU). Zero when not running.
 /// Used by the SIGTERM/SIGINT handler to forward signals to the VM.
+#[cfg(unix)]
 static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,11 +70,15 @@ pub struct VmLaunchConfig {
 
 pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
     match config.backend {
+        #[cfg(unix)]
         VmBackend::Qemu => run_qemu_vm(config),
+        #[cfg(not(unix))]
+        VmBackend::Qemu => Err("the QEMU backend is not supported on this platform".to_string()),
         VmBackend::Libkrun => run_libkrun_vm(config),
     }
 }
 
+#[cfg(unix)]
 fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
     if !config.mounts.is_empty() {
         return Err("virtiofs mounts are not yet supported with the QEMU backend".to_string());
@@ -185,10 +197,12 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
     }
 }
 
+#[cfg(unix)]
 fn qemu_network_args() -> [&'static str; 2] {
     ["-nic", "none"]
 }
 
+#[cfg(unix)]
 fn qemu_disk_args(config: &VmLaunchConfig) -> Vec<String> {
     let mut args = vec![
         "-drive".to_string(),
@@ -220,6 +234,7 @@ fn qemu_disk_args(config: &VmLaunchConfig) -> Vec<String> {
     args
 }
 
+#[cfg(unix)]
 /// Write environment variables into the overlay disk so the guest init script
 /// can source them after the overlay root is mounted. QEMU does not provide a
 /// `krun_set_exec` equivalent, so the launcher injects this small per-sandbox
@@ -239,6 +254,7 @@ fn write_guest_env_file(overlay_disk: &Path, env_vars: &[String]) -> Result<(), 
     )
 }
 
+#[cfg(unix)]
 fn qemu_guest_env_vars(config: &VmLaunchConfig) -> Vec<String> {
     let mut env_vars = config.env.clone();
     if config.gpu_bdf.is_some() {
@@ -248,6 +264,7 @@ fn qemu_guest_env_vars(config: &VmLaunchConfig) -> Vec<String> {
     env_vars
 }
 
+#[cfg(unix)]
 /// Escape a string for use inside bash double quotes.
 fn shell_escape(s: &str) -> String {
     s.replace('\\', "\\\\")
@@ -258,6 +275,7 @@ fn shell_escape(s: &str) -> String {
         .replace('\r', "\\r")
 }
 
+#[cfg(unix)]
 fn build_kernel_cmdline(config: &VmLaunchConfig) -> String {
     let mut parts = vec![
         "console=ttyS0".to_string(),
@@ -275,6 +293,7 @@ fn build_kernel_cmdline(config: &VmLaunchConfig) -> String {
     parts.join(" ")
 }
 
+#[cfg(unix)]
 /// Shared procguard cleanup callback for both libkrun and QEMU paths.
 /// Only async-signal-safe calls: atomic loads and `kill(2)`.
 fn procguard_kill_children() {
@@ -292,6 +311,7 @@ fn procguard_kill_children() {
     }
 }
 
+#[cfg(unix)]
 fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
     if let Some(kernel_image) = &config.kernel_image {
         return Err(format!(
@@ -401,6 +421,310 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
     }
 }
 
+#[cfg(windows)]
+fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle as _;
+
+    if let Some(kernel_image) = &config.kernel_image {
+        return Err(format!(
+            "selected kernel image is not supported by this VM backend: {}",
+            kernel_image.display()
+        ));
+    }
+    let mut disks = vec![
+        ("root", config.root_disk.as_path(), true),
+        ("overlay", config.overlay_disk.as_path(), false),
+    ];
+    if let Some(image_disk) = &config.image_disk {
+        disks.push(("image", image_disk.as_path(), true));
+    }
+    for (id, path, _) in &disks {
+        if !path.is_file() {
+            return Err(format!("{id} disk image not found: {}", path.display()));
+        }
+    }
+
+    let runtime_dir = configured_runtime_dir()?;
+    validate_runtime_dir(&runtime_dir)?;
+    configure_runtime_loader_env(&runtime_dir)?;
+    let krun = ffi::libkrun(&runtime_dir)?;
+    let init_binary_path = ffi::krun_init_binary_path(&runtime_dir);
+    // The VM borrows overlay contents until it exits, so leak them.
+    let init_binary: &'static [u8] = Box::leak(
+        std::fs::read(&init_binary_path)
+            .map_err(|e| format!("read {}: {e}", init_binary_path.display()))?
+            .into_boxed_slice(),
+    );
+
+    let mut error = std::ptr::null_mut();
+    krun.check_result(
+        unsafe {
+            (krun.krun_init_log)(
+                std::io::stderr().as_raw_handle() as u64,
+                clamp_log_level(config.log_level),
+                ffi::KRUN_LOG_STYLE_AUTO,
+                ffi::KRUN_LOG_OPTION_NO_ENV,
+                &raw mut error,
+            )
+        },
+        error,
+        "krun_init_log",
+    )?;
+
+    // Guest init: the files and kernel argument `krun_init_config_apply`
+    // would add. The block root remount and exec go through the init config
+    // instead of the 1.x context API.
+    let mut env = libkrun_guest_env(config);
+    env.push("KRUN_BLOCK_ROOT_DEVICE=/dev/vda".to_string());
+    env.push("KRUN_BLOCK_ROOT_FSTYPE=ext4".to_string());
+    env.push("KRUN_BLOCK_ROOT_OPTIONS=ro".to_string());
+    let mut argv = vec![config.exec_path.clone()];
+    argv.extend(config.args.iter().cloned());
+    let init_config: &'static [u8] = Box::leak(
+        serde_json::to_vec(&serde_json::json!({
+            "process": { "args": argv, "env": env, "cwd": config.workdir },
+        }))
+        .map_err(|e| format!("encode libkrun init config: {e}"))?
+        .into_boxed_slice(),
+    );
+
+    let overlay = unsafe { (krun.krun_fs_overlay_new)() };
+    // The null virtiofs root needs mount points for the init before it
+    // pivots to the block root.
+    for dir in ["dev", "proc", "sys", "newroot"] {
+        let mut error = std::ptr::null_mut();
+        krun.check_result(
+            unsafe {
+                (krun.krun_fs_overlay_add_dir)(
+                    overlay,
+                    ffi::KrunStr::new(dir),
+                    0o040_755,
+                    &raw mut error,
+                )
+            },
+            error,
+            "krun_fs_overlay_add_dir",
+        )?;
+    }
+    for (path, data, mode) in [
+        ("init.krun", init_binary, 0o755),
+        (".krun_config.json", init_config, 0o644),
+    ] {
+        let mut error = std::ptr::null_mut();
+        krun.check_result(
+            unsafe {
+                (krun.krun_fs_overlay_add_file)(
+                    overlay,
+                    ffi::KrunStr::new(path),
+                    ffi::KrunBytes::new(data),
+                    mode,
+                    true,
+                    &raw mut error,
+                )
+            },
+            error,
+            "krun_fs_overlay_add_file",
+        )?;
+    }
+    let mut error = std::ptr::null_mut();
+    let payload = krun.check_object(
+        unsafe { (krun.krun_payload_load_krunfw)(&raw mut error) },
+        error,
+        "krun_payload_load_krunfw",
+    )?;
+    unsafe { (krun.krun_payload_append_cmdline)(payload, ffi::KrunStr::new("init=/init.krun")) };
+    // POC debugging aid: verbose kernel log on the console.
+    if std::env::var_os("OPENSHELL_VM_KERNEL_DEBUG").is_some() {
+        unsafe { (krun.krun_payload_append_cmdline)(payload, ffi::KrunStr::new("loglevel=8")) };
+    }
+
+    // The Windows libkrunfw kernel is built without PCI, ACPI or an 8250
+    // UART: use virtio-mmio and the virtio console (hvc0). A kernel with
+    // virtio-pci support can opt in with OPENSHELL_VM_TRANSPORT=pci.
+    let use_pci = std::env::var("OPENSHELL_VM_TRANSPORT").is_ok_and(|t| t == "pci");
+    let devices = unsafe {
+        if use_pci {
+            (krun.krun_pci_device_manager_new)()
+        } else {
+            (krun.krun_mmio_device_manager_new)()
+        }
+    };
+    if devices.is_null() {
+        return Err("krun device manager creation failed".to_string());
+    }
+    let add = |device| unsafe {
+        if use_pci {
+            (krun.krun_pci_device_manager_add)(devices, device);
+        } else {
+            (krun.krun_mmio_device_manager_add)(devices, device);
+        }
+    };
+
+    let mut error = std::ptr::null_mut();
+    let root_fs = krun.check_object(
+        unsafe { (krun.krun_fs_device_new_null)(ffi::KrunStr::new("/dev/root"), &raw mut error) },
+        error,
+        "krun_fs_device_new_null",
+    )?;
+    unsafe { (krun.krun_fs_device_set_overlay)(root_fs, overlay) };
+    add(root_fs);
+
+    // PCI slot order fixes guest naming: root=/dev/vda, overlay=/dev/vdb,
+    // then the optional image disk.
+    for (id, path, read_only) in &disks {
+        let path = path_str(path)?;
+        let mut error = std::ptr::null_mut();
+        let block = krun.check_object(
+            unsafe {
+                (krun.krun_block_device_new)(
+                    ffi::KrunStr::new(id),
+                    ffi::KrunStr::new(path),
+                    ffi::KRUN_DISK_FORMAT_RAW,
+                    &raw mut error,
+                )
+            },
+            error,
+            "krun_block_device_new",
+        )?;
+        unsafe { (krun.krun_block_device_set_read_only)(block, *read_only) };
+        add(block);
+    }
+
+    let mut error = std::ptr::null_mut();
+    let vsock = krun.check_object(
+        unsafe { (krun.krun_vsock_device_new)(3, 0, &raw mut error) },
+        error,
+        "krun_vsock_device_new",
+    )?;
+    if let Some(port_map) = &config.vsock_port_map {
+        if port_map.host_initiated {
+            let _ = std::fs::remove_file(&port_map.host_socket);
+        }
+        unsafe {
+            (krun.krun_vsock_device_add_unix_port)(
+                vsock,
+                port_map.guest_port,
+                ffi::KrunStr::new(path_str(&port_map.host_socket)?),
+                port_map.host_initiated,
+            );
+        }
+    }
+    add(vsock);
+
+    for mount in &config.mounts {
+        let host_path = path_str(&mount.host_path)?;
+        let new_fs = if mount.read_only {
+            krun.krun_fs_device_new_read_only
+        } else {
+            krun.krun_fs_device_new
+        };
+        let mut error = std::ptr::null_mut();
+        let fs = krun.check_object(
+            unsafe {
+                new_fs(
+                    ffi::KrunStr::new(&mount.tag),
+                    ffi::KrunStr::new(host_path),
+                    &raw mut error,
+                )
+            },
+            error,
+            "krun_fs_device_new",
+        )?;
+        add(fs);
+    }
+
+    let mut error = std::ptr::null_mut();
+    add(krun.check_object(
+        unsafe { (krun.krun_rng_device_new)(&raw mut error) },
+        error,
+        "krun_rng_device_new",
+    )?);
+
+    // Only terminal-backed ports become hvc0, so with a log file the kernel
+    // console goes to the libkrun log (launcher stderr) while libkrun init
+    // redirects the guest command's stdout/stderr to krun-stdout and
+    // krun-stderr, both backed by the console log. The VM borrows the handle.
+    // Plain write access: libkrun duplicates the handle for its writer.
+    let console = Box::leak(Box::new(
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&config.console_output)
+            .map_err(|e| format!("open console {}: {e}", config.console_output.display()))?,
+    ));
+    {
+        use std::io::Seek as _;
+        console
+            .seek(std::io::SeekFrom::End(0))
+            .map_err(|e| format!("seek console {}: {e}", config.console_output.display()))?;
+    }
+    let console_builder = unsafe { (krun.krun_console_device_builder)() };
+    let mut error = std::ptr::null_mut();
+    krun.check_result(
+        unsafe {
+            (krun.krun_console_builder_add_default_console)(
+                console_builder,
+                std::ptr::null_mut(),
+                console.as_raw_handle(),
+                console.as_raw_handle(),
+                &raw mut error,
+            )
+        },
+        error,
+        "krun_console_builder_add_default_console",
+    )?;
+    let mut error = std::ptr::null_mut();
+    add(krun.check_object(
+        unsafe { (krun.krun_console_builder_build)(console_builder, &raw mut error) },
+        error,
+        "krun_console_builder_build",
+    )?);
+
+    let mut builder = unsafe { (krun.krun_vmm_builder_new)() };
+    let mut error = std::ptr::null_mut();
+    krun.check_result(
+        unsafe { (krun.krun_vmm_builder_vcpus)(&raw mut builder, config.vcpus, &raw mut error) },
+        error,
+        "krun_vmm_builder_vcpus",
+    )?;
+    let mut error = std::ptr::null_mut();
+    krun.check_result(
+        unsafe {
+            (krun.krun_vmm_builder_ram_mib)(&raw mut builder, config.mem_mib, &raw mut error)
+        },
+        error,
+        "krun_vmm_builder_ram_mib",
+    )?;
+    unsafe {
+        (krun.krun_vmm_builder_payload)(&raw mut builder, payload);
+        (krun.krun_vmm_builder_devices)(&raw mut builder, devices);
+    }
+    let mut error = std::ptr::null_mut();
+    krun.check_result(
+        unsafe { (krun.krun_vmm_builder_acpi)(&raw mut builder, use_pci, &raw mut error) },
+        error,
+        "krun_vmm_builder_acpi",
+    )?;
+    let mut error = std::ptr::null_mut();
+    let vmm = krun.check_object(
+        unsafe { (krun.krun_vmm_builder_build)(&raw mut builder, &raw mut error) },
+        error,
+        "krun_vmm_builder_build",
+    )?;
+
+    // This launcher process is the VM: the driver stops it by terminating the
+    // process, and the driver's Job Object takes it down with the driver.
+    unsafe { (krun.krun_vmm_run)(vmm) };
+    Ok(())
+}
+
+#[cfg(windows)]
+fn path_str(path: &Path) -> Result<&str, String> {
+    path.to_str()
+        .ok_or_else(|| format!("path is not valid UTF-8: {}", path.display()))
+}
+
 fn libkrun_guest_env(config: &VmLaunchConfig) -> Vec<String> {
     let mut env = if config.env.is_empty() {
         vec![
@@ -439,6 +763,7 @@ pub fn configured_runtime_dir() -> Result<PathBuf, String> {
     embedded_runtime::ensure_runtime_extracted()
 }
 
+#[cfg(unix)]
 fn qemu_runtime_dir() -> Result<PathBuf, String> {
     configured_runtime_dir().map_err(|_| {
         "QEMU backend requires OPENSHELL_VM_RUNTIME_DIR to be set (pointing to a directory \
@@ -476,11 +801,28 @@ fn configure_runtime_loader_env(runtime_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+fn configure_runtime_loader_env(runtime_dir: &Path) -> Result<(), String> {
+    // libkrun loads libkrunfw.dll by bare name; keep the runtime directory
+    // first on the DLL search path.
+    let existing = std::env::var_os("PATH");
+    let mut paths = vec![runtime_dir.to_path_buf()];
+    if let Some(existing) = existing {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    let joined = std::env::join_paths(paths).map_err(|e| format!("join PATH: {e}"))?;
+    unsafe {
+        std::env::set_var("PATH", joined);
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn configure_runtime_loader_env(_runtime_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn raise_nofile_limit() {
     #[cfg(unix)]
     if let Ok((_, maximum)) =
@@ -505,11 +847,13 @@ fn clamp_log_level(level: u32) -> u32 {
     }
 }
 
+#[cfg(unix)]
 struct VmContext {
     krun: &'static ffi::LibKrun,
     ctx_id: u32,
 }
 
+#[cfg(unix)]
 impl VmContext {
     fn create(runtime_dir: &Path, log_level: u32) -> Result<Self, String> {
         let krun = ffi::libkrun(runtime_dir)?;
@@ -710,6 +1054,7 @@ impl VmContext {
     }
 }
 
+#[cfg(unix)]
 impl Drop for VmContext {
     fn drop(&mut self) {
         let ret = unsafe { (self.krun.krun_free_ctx)(self.ctx_id) };
@@ -722,6 +1067,7 @@ impl Drop for VmContext {
     }
 }
 
+#[cfg(unix)]
 fn install_signal_forwarding(pid: i32) {
     unsafe {
         libc::signal(
@@ -736,6 +1082,7 @@ fn install_signal_forwarding(pid: i32) {
     CHILD_PID.store(pid, Ordering::Relaxed);
 }
 
+#[cfg(unix)]
 /// Async-signal-safe handler that forwards SIGTERM to the VM worker.
 ///
 /// Only async-signal-safe libc calls are used — `kill(2)` is listed in
@@ -750,6 +1097,7 @@ extern "C" fn forward_signal(_sig: libc::c_int) {
     }
 }
 
+#[cfg(unix)]
 fn wait_for_child(pid: i32) -> Result<libc::c_int, String> {
     let mut status: libc::c_int = 0;
     let rc = unsafe { libc::waitpid(pid, &raw mut status, 0) };
@@ -762,6 +1110,7 @@ fn wait_for_child(pid: i32) -> Result<libc::c_int, String> {
     Ok(status)
 }
 
+#[cfg(unix)]
 fn check(ret: i32, func: &'static str) -> Result<(), String> {
     if ret < 0 {
         Err(format!("{func} failed with error code {ret}"))
@@ -770,6 +1119,7 @@ fn check(ret: i32, func: &'static str) -> Result<(), String> {
     }
 }
 
+#[cfg(unix)]
 fn c_string_array(strings: &[&str]) -> Result<(Vec<CString>, Vec<*const libc::c_char>), String> {
     let owned: Vec<CString> = strings
         .iter()
@@ -781,6 +1131,7 @@ fn c_string_array(strings: &[&str]) -> Result<(Vec<CString>, Vec<*const libc::c_
     Ok((owned, ptrs))
 }
 
+#[cfg(unix)]
 fn path_to_cstring(path: &Path) -> Result<CString, String> {
     let path = path
         .to_str()
@@ -799,7 +1150,7 @@ fn check_kvm_access() -> Result<(), String> {
         })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

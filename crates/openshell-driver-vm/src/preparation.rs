@@ -11,14 +11,18 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(unix)]
 use nix::sys::signal::{Signal, killpg};
+#[cfg(unix)]
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, ChildStdout, Command};
@@ -129,12 +133,11 @@ impl Attempt {
         let name = format!("attempt-{random:032x}");
         let directory = root.join(&name);
         let lease_path = root.join(format!("{name}.lease"));
-        let mut lease = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&lease_path)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut lease = options.open(&lease_path)?;
         lock(&lease, false)?;
         lease.write_all(LEASE_MARKER)?;
         lease.sync_data()?;
@@ -154,15 +157,23 @@ impl Attempt {
             .lease
             .as_ref()
             .ok_or_else(|| io::Error::other("preparation lease is closed"))?;
+        #[cfg(unix)]
         let fd = lease.as_raw_fd();
+        // Windows children do not inherit the lease handle: the driver holds
+        // the only lock and kills the worker before reclaiming staging.
+        #[cfg(not(unix))]
+        let fd = {
+            let _ = lease;
+            -1
+        };
         request.lease_fd = fd;
         request.parent_pid = std::process::id();
         let request_path = self.directory.join(REQUEST_FILE);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&request_path)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&request_path)?;
         serde_json::to_writer(&mut file, &request)?;
         file.flush()?;
         let mut command = Command::new(launcher);
@@ -171,9 +182,12 @@ impl Attempt {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        command.process_group(0).kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        command.kill_on_drop(true);
         // SAFETY: the child only makes an async-signal-safe fcntl call. The
         // parent keeps this descriptor open until the child has exited.
+        #[cfg(unix)]
         unsafe {
             command.pre_exec(move || {
                 if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
@@ -191,6 +205,16 @@ impl Attempt {
         Ok(stdout)
     }
 
+    #[cfg(not(unix))]
+    pub async fn wait(&mut self) -> io::Result<ExitStatus> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("preparation worker is missing"))?
+            .wait()
+            .await
+    }
+
+    #[cfg(unix)]
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
         // EOF can precede observable process exit. Let normal worker teardown
         // finish before signaling, preserving its real status and reserving
@@ -256,6 +280,16 @@ impl Attempt {
 
     // macOS may replace the staging lease when proving an exited process group
     // has no remaining owner; other platforms only read the worker state.
+    #[cfg(not(unix))]
+    #[allow(clippy::unnecessary_wraps)]
+    fn kill_group(&mut self) -> io::Result<()> {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
     #[cfg_attr(not(target_os = "macos"), allow(clippy::needless_pass_by_ref_mut))]
     fn kill_group(&mut self) -> io::Result<()> {
         if let Some(id) = self.child.as_ref().and_then(Child::id) {
@@ -298,6 +332,7 @@ impl Attempt {
 }
 
 /// Observe termination without releasing the PID or process-group identity.
+#[cfg(unix)]
 fn worker_has_exited(id: u32) -> io::Result<bool> {
     // SAFETY: waitid writes initialized storage. WNOWAIT leaves the owned
     // child unreaped, so its PID cannot be reused before descendant signaling.
@@ -321,6 +356,7 @@ fn worker_has_exited(id: u32) -> io::Result<bool> {
 
 /// Bound EOF-to-exit observation without blocking the runtime or reaping.
 /// Dropping this future leaves the worker available to cancellation cleanup.
+#[cfg(unix)]
 async fn wait_for_worker_exit(id: Option<u32>) -> io::Result<()> {
     let Some(id) = id else {
         return Ok(());
@@ -387,12 +423,11 @@ fn reclaim(directory: &Path, lease_path: &Path) -> io::Result<bool> {
     if !directory.try_exists()? && !lease_path.try_exists()? {
         return Ok(true);
     }
-    let lease = match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(lease_path)
-    {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let lease = match options.open(lease_path) {
         Ok(lease) if lease.metadata()?.is_file() => lease,
         Ok(_) => return Ok(false),
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -419,6 +454,20 @@ fn reclaim(directory: &Path, lease_path: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
+#[cfg(not(unix))]
+fn lock(file: &File, nonblocking: bool) -> io::Result<bool> {
+    if !nonblocking {
+        file.lock()?;
+        return Ok(true);
+    }
+    match file.try_lock() {
+        Ok(()) => Ok(true),
+        Err(fs::TryLockError::WouldBlock) => Ok(false),
+        Err(fs::TryLockError::Error(error)) => Err(error),
+    }
+}
+
+#[cfg(unix)]
 fn lock(file: &File, nonblocking: bool) -> io::Result<bool> {
     let operation = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
     // SAFETY: flock receives a valid borrowed file descriptor and no pointers.
@@ -434,14 +483,11 @@ fn lock(file: &File, nonblocking: bool) -> io::Result<bool> {
 }
 
 pub(super) fn cache_lock(cache_root: &Path) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(cache_root.join("preparation.lock"))?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(cache_root.join("preparation.lock"))?;
     lock(&file, false)?;
     Ok(file)
 }
@@ -471,12 +517,11 @@ pub(super) fn publish_cache_file(
 }
 
 pub(super) fn read_request(path: &Path) -> Result<(Request, PathBuf), String> {
-    use std::os::unix::fs::MetadataExt;
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|error| error.to_string())?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(path).map_err(|error| error.to_string())?;
     let metadata = file.metadata().map_err(|error| error.to_string())?;
     if !metadata.is_file() || metadata.len() > 1024 * 1024 {
         return Err(
@@ -498,23 +543,33 @@ pub(super) fn read_request(path: &Path) -> Result<(Request, PathBuf), String> {
     {
         return Err("preparation request is outside the driver staging directory".to_string());
     }
-    let lease_file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+    let lease_file = options
         .open(expected_root.join(format!("{name}.lease")))
         .map_err(|error| error.to_string())?;
     let lease = lease_file.metadata().map_err(|error| error.to_string())?;
     if !lease.is_file() {
         return Err("image preparation lease must be a regular file".to_string());
     }
-    let mut marker = Vec::new();
-    lease_file
-        .take(64)
-        .read_to_end(&mut marker)
-        .map_err(|error| error.to_string())?;
-    if marker != LEASE_MARKER {
-        return Err("image preparation lease marker is invalid".to_string());
+    // Windows byte-range locks are mandatory: the lease the driver holds
+    // locked cannot be read here, and no descriptor is inherited to verify.
+    #[cfg(unix)]
+    {
+        let mut marker = Vec::new();
+        lease_file
+            .take(64)
+            .read_to_end(&mut marker)
+            .map_err(|error| error.to_string())?;
+        if marker != LEASE_MARKER {
+            return Err("image preparation lease marker is invalid".to_string());
+        }
+        verify_inherited_lease(&request, &lease)?;
     }
+    Ok((request, directory.to_path_buf()))
+}
+
+#[cfg(unix)]
+fn verify_inherited_lease(request: &Request, lease: &fs::Metadata) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
     // SAFETY: fstat writes only to the supplied initialized stat storage. An
     // invalid inherited descriptor is rejected rather than taken into ownership.
     let mut inherited: libc::stat = unsafe { std::mem::zeroed() };
@@ -529,11 +584,10 @@ pub(super) fn read_request(path: &Path) -> Result<(Request, PathBuf), String> {
     if inherited.st_ino != lease.ino() || inherited_device != lease.dev() {
         return Err("image preparation lease was not inherited".to_string());
     }
-    Ok((request, directory.to_path_buf()))
+    Ok(())
 }
 
-/// A process-group watcher also covers host utilities on Linux, where a
-/// parent-death signal on the worker alone cannot kill its children.
+#[cfg(unix)]
 pub(super) fn watch_parent(parent_pid: u32) -> Result<(), String> {
     let expected = i32::try_from(parent_pid).map_err(|error| error.to_string())?;
     if nix::unistd::getpgrp() != nix::unistd::getpid() {
@@ -561,7 +615,7 @@ pub(super) fn send(message: &Message) -> io::Result<()> {
     output.flush()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};

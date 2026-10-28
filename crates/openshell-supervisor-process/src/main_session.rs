@@ -296,7 +296,7 @@ impl MainSession {
         session
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn publish_test_output(&self, data: &'static [u8]) {
         self.publish(MainOutput::Stdout(Bytes::from_static(data)));
     }

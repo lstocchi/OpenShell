@@ -6,7 +6,7 @@
 #[path = "preparation.rs"]
 mod preparation;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "registry_cache_tests.rs"]
 mod registry_cache_tests;
 
@@ -18,11 +18,13 @@ use crate::lifecycle::{
     BackendFeature, GuestInitDropin, LaunchAbortReason, LaunchPlan, LifecycleExtensionRegistry,
     RestoreContext, extension_state_dir,
 };
+#[cfg(not(windows))]
+use crate::rootfs::extract_rootfs_archive_to;
 use crate::rootfs::{
     clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
-    ext4_image_has_directory, extract_host_supervisor, extract_rootfs_archive_to,
-    prepare_sandbox_rootfs_from_image_root, recover_rootfs_image, remove_rootfs_image_file,
-    sandbox_guest_init_path, sandbox_guest_runtime_identity, sandbox_guest_user_ids_from_image,
+    ext4_image_has_directory, extract_host_supervisor, prepare_sandbox_rootfs_from_image_root,
+    recover_rootfs_image, remove_rootfs_image_file, sandbox_guest_init_path,
+    sandbox_guest_runtime_identity, sandbox_guest_user_ids_from_image,
     sandbox_guest_user_ids_from_overlay_image, set_rootfs_image_file_mode,
     validate_host_supervisor, write_rootfs_image_file,
 };
@@ -33,8 +35,11 @@ use bollard::models::ContainerCreateBody;
 use bollard::query_parameters::{CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder};
 use flate2::read::{GzDecoder, MultiGzDecoder};
 use futures::{Stream, StreamExt, TryStreamExt};
+#[cfg(unix)]
 use nix::errno::Errno;
+#[cfg(unix)]
 use nix::sys::signal::{Signal, kill};
+#[cfg(unix)]
 use nix::unistd::Pid;
 use oci_client::client::{Client as OciClient, ClientConfig};
 use oci_client::errors::{OciDistributionError, OciErrorCode};
@@ -93,9 +98,15 @@ use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt as _;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt as _;
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::process::{ExitStatus, Stdio};
+#[cfg(windows)]
+use std::ptr::{null, null_mut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -108,6 +119,35 @@ use tonic::{Request, Response, Status};
 use tracing::{Instrument as _, info, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use url::{Host, Url};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{
+    ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+};
+#[cfg(windows)]
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+#[cfg(windows)]
+use windows_sys::Win32::Security::{
+    GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+    OPEN_EXISTING,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+};
+
+#[cfg(unix)]
+type SocketRootFd = OwnedFd;
+
+#[cfg(windows)]
+type SocketRootFd = OwnedHandle;
 
 const DRIVER_NAME: &str = "openshell-driver-vm";
 const WATCH_BUFFER: usize = 256;
@@ -734,7 +774,7 @@ fn provisioning_span(
 pub struct VmDriver {
     config: VmDriverConfig,
     socket_root: PathBuf,
-    socket_root_fd: Arc<OwnedFd>,
+    socket_root_fd: Arc<SocketRootFd>,
     launcher_bin: PathBuf,
     registry: Arc<Mutex<HashMap<String, SandboxRecord>>>,
     image_cache_lock: Arc<Mutex<()>>,
@@ -1015,6 +1055,9 @@ impl VmDriver {
             .env(openshell_core::sandbox_env::ENDPOINT, openshell_endpoint)
             .env(openshell_core::sandbox_env::SANDBOX_ID, &sandbox.id)
             .env(openshell_core::sandbox_env::SANDBOX, &sandbox.name)
+            // The supervisor serves SSH on this socket: a Unix domain socket
+            // on Unix, a WinSock AF_UNIX socket on Windows. The containing
+            // per-sandbox directory is restricted to the driver's user.
             .env(
                 openshell_core::sandbox_env::SSH_SOCKET_PATH,
                 sandbox_socket_dir(&self.socket_root, &sandbox.id).join("ssh.sock"),
@@ -1261,7 +1304,7 @@ impl VmDriver {
             let mut registry = self.registry.lock().await;
             registry.remove(&sandbox.id);
             let _ = tokio::fs::remove_dir_all(&state_dir).await;
-            remove_sandbox_socket_dir(&self.socket_root_fd, &sandbox.id);
+            self.remove_sandbox_socket_dir(&sandbox.id);
             return Err(err);
         }
 
@@ -1269,7 +1312,7 @@ impl VmDriver {
             let mut registry = self.registry.lock().await;
             registry.remove(&sandbox.id);
             let _ = tokio::fs::remove_dir_all(&state_dir).await;
-            remove_sandbox_socket_dir(&self.socket_root_fd, &sandbox.id);
+            self.remove_sandbox_socket_dir(&sandbox.id);
             return Err(Status::internal(format!(
                 "write sandbox start metadata failed: {err}"
             )));
@@ -1345,7 +1388,7 @@ impl VmDriver {
                 if overlay_preparation == OverlayPreparation::Fresh {
                     let _ = tokio::fs::remove_dir_all(&state_dir).await;
                 }
-                remove_sandbox_socket_dir(&self.socket_root_fd, &sandbox_id);
+                self.remove_sandbox_socket_dir(&sandbox_id);
                 return;
             }
 
@@ -2179,7 +2222,7 @@ impl VmDriver {
         }
 
         remove_sandbox_state_dir(&self.config.state_dir, &state_dir).await?;
-        remove_sandbox_socket_dir(&self.socket_root_fd, &record_id);
+        self.remove_sandbox_socket_dir(&record_id);
 
         {
             let mut registry = self.registry.lock().await;
@@ -2827,7 +2870,7 @@ impl VmDriver {
 
         if may_remove_state {
             let _ = tokio::fs::remove_dir_all(state_dir).await;
-            remove_sandbox_socket_dir(&self.socket_root_fd, sandbox_id);
+            self.remove_sandbox_socket_dir(sandbox_id);
         }
         self.publish_platform_event(
             sandbox_id.to_string(),
@@ -3286,7 +3329,7 @@ impl VmDriver {
         image_ref: &str,
     ) -> Result<String, Status> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
-        if let Some((engine, image_identity)) =
+        if let Some((engine, engine_kind, image_identity)) =
             self.resolve_local_container_image(image_ref).await?
         {
             let result = self
@@ -3294,6 +3337,7 @@ impl VmDriver {
                     sandbox_id,
                     image_ref,
                     &engine,
+                    engine_kind,
                     &image_identity,
                 )
                 .await;
@@ -3449,6 +3493,18 @@ impl VmDriver {
             return span_status.finish(Ok(image_identity));
         }
 
+        #[cfg(windows)]
+        {
+            let _ = (client, auth);
+            self.build_windows_bootstrap_rootfs_image(
+                sandbox_id,
+                &reference,
+                image_ref,
+                &image_identity,
+            )
+            .await?;
+        }
+        #[cfg(not(windows))]
         self.build_cached_registry_image_rootfs_image(
             sandbox_id,
             client,
@@ -3466,74 +3522,87 @@ impl VmDriver {
     async fn resolve_local_container_image(
         &self,
         image_ref: &str,
-    ) -> Result<Option<(Docker, String)>, Status> {
+    ) -> Result<Option<(Docker, LocalContainerEngine, String)>, Status> {
         let required_local_image = is_openshell_local_build_image_ref(image_ref);
-        let engine = match connect_local_container_engine().await {
-            Some(engine) => engine,
-            None if required_local_image => {
+        let engines = connect_local_container_engines().await;
+        if engines.is_empty() {
+            if required_local_image {
                 return Err(Status::failed_precondition(format!(
                     "no container engine (Docker/Podman) available for locally built sandbox image '{image_ref}'"
                 )));
             }
-            None => {
-                warn!(
-                    image_ref = %image_ref,
-                    "vm driver: no local container engine available, falling back to registry"
-                );
-                return Ok(None);
-            }
-        };
+            warn!(
+                image_ref = %image_ref,
+                "vm driver: no local container engine available, falling back to registry"
+            );
+            return Ok(None);
+        }
 
-        match engine.inspect_image(image_ref).await {
-            Ok(inspect) => {
-                if let Some(message) = local_image_platform_mismatch(
-                    image_ref,
-                    inspect.os.as_deref(),
-                    inspect.architecture.as_deref(),
-                ) {
-                    if required_local_image {
-                        return Err(Status::failed_precondition(message));
+        let mut platform_mismatch = None;
+        let mut inspection_error = None;
+        for (engine, engine_kind) in engines {
+            match engine.inspect_image(image_ref).await {
+                Ok(inspect) => {
+                    if let Some(message) = local_image_platform_mismatch(
+                        image_ref,
+                        inspect.os.as_deref(),
+                        inspect.architecture.as_deref(),
+                    ) {
+                        platform_mismatch.get_or_insert(message);
+                        continue;
                     }
-                    warn!(
-                        image_ref = %image_ref,
-                        %message,
-                        "vm driver: local container image platform mismatch, falling back to registry"
-                    );
-                    return Ok(None);
-                }
 
-                let image_identity = inspect.id.filter(|id| !id.trim().is_empty()).ok_or_else(
-                    || {
-                        Status::failed_precondition(format!(
-                            "local container image '{image_ref}' inspect response has no image ID"
-                        ))
-                    },
-                )?;
-                info!(
-                    image_ref = %image_ref,
-                    image_identity = %image_identity,
-                    "vm driver: resolved image from local container engine"
-                );
-                Ok(Some((engine, image_identity)))
-            }
-            Err(err) if is_docker_not_found_error(&err) && required_local_image => {
-                Err(Status::failed_precondition(format!(
-                    "locally built sandbox image '{image_ref}' is not present in the local container engine"
-                )))
-            }
-            Err(err) if is_docker_not_found_error(&err) => Ok(None),
-            Err(err) if required_local_image => Err(Status::failed_precondition(format!(
-                "failed to inspect locally built sandbox image '{image_ref}': {err}"
-            ))),
-            Err(err) => {
-                warn!(
-                    image_ref = %image_ref,
-                    error = %err,
-                    "vm driver: local container image inspection failed, falling back to registry"
-                );
-                Ok(None)
+                    let image_identity = inspect
+                        .id
+                        .filter(|id| !id.trim().is_empty())
+                        .ok_or_else(|| {
+                            Status::failed_precondition(format!(
+                                "local container image '{image_ref}' inspect response has no image ID"
+                            ))
+                        })?;
+                    info!(
+                        image_ref = %image_ref,
+                        image_identity = %image_identity,
+                        engine = ?engine_kind,
+                        "vm driver: resolved image from local container engine"
+                    );
+                    return Ok(Some((engine, engine_kind, image_identity)));
+                }
+                Err(err) if is_docker_not_found_error(&err) => {}
+                Err(err) => {
+                    inspection_error.get_or_insert_with(|| err.to_string());
+                }
             }
         }
+
+        if required_local_image {
+            if let Some(message) = platform_mismatch {
+                return Err(Status::failed_precondition(message));
+            }
+            if let Some(error) = inspection_error {
+                return Err(Status::failed_precondition(format!(
+                    "failed to inspect locally built sandbox image '{image_ref}': {error}"
+                )));
+            }
+            return Err(Status::failed_precondition(format!(
+                "locally built sandbox image '{image_ref}' is not present in the local container engine"
+            )));
+        }
+
+        if let Some(message) = platform_mismatch {
+            warn!(
+                image_ref = %image_ref,
+                %message,
+                "vm driver: local container image platform mismatch, falling back to registry"
+            );
+        } else if let Some(error) = inspection_error {
+            warn!(
+                image_ref = %image_ref,
+                %error,
+                "vm driver: local container image inspection failed, falling back to registry"
+            );
+        }
+        Ok(None)
     }
 
     async fn ensure_cached_local_image_rootfs_image(
@@ -3541,8 +3610,13 @@ impl VmDriver {
         sandbox_id: &str,
         image_ref: &str,
         docker: &Docker,
+        engine_kind: LocalContainerEngine,
         image_identity: &str,
     ) -> Result<String, Status> {
+        #[cfg(windows)]
+        let _ = docker;
+        let image_source = engine_kind.image_source();
+
         let cache_identity = bootstrap_image_cache_identity(image_identity);
         let image_path = image_cache_rootfs_image(&self.config.state_dir, &cache_identity);
 
@@ -3563,7 +3637,7 @@ impl VmDriver {
                 format!("Using cached VM root disk for local image \"{image_ref}\""),
                 HashMap::from([
                     ("image_ref".to_string(), image_ref.to_string()),
-                    ("image_source".to_string(), "local_docker".to_string()),
+                    ("image_source".to_string(), image_source.to_string()),
                     ("cache_hit".to_string(), "true".to_string()),
                     ("image_identity".to_string(), cache_identity.clone()),
                 ]),
@@ -3579,7 +3653,7 @@ impl VmDriver {
             format!("Preparing VM root disk cache for local image \"{image_ref}\""),
             HashMap::from([
                 ("image_ref".to_string(), image_ref.to_string()),
-                ("image_source".to_string(), "local_docker".to_string()),
+                ("image_source".to_string(), image_source.to_string()),
                 ("cache_hit".to_string(), "false".to_string()),
                 ("image_identity".to_string(), cache_identity.clone()),
             ]),
@@ -3601,7 +3675,7 @@ impl VmDriver {
                 format!("Using cached VM root disk for local image \"{image_ref}\""),
                 HashMap::from([
                     ("image_ref".to_string(), image_ref.to_string()),
-                    ("image_source".to_string(), "local_docker".to_string()),
+                    ("image_source".to_string(), image_source.to_string()),
                     ("cache_hit".to_string(), "true".to_string()),
                     ("image_identity".to_string(), cache_identity.clone()),
                 ]),
@@ -3611,6 +3685,15 @@ impl VmDriver {
             return Ok(cache_identity);
         }
 
+        #[cfg(windows)]
+        self.build_cached_local_image_rootfs_image(
+            sandbox_id,
+            engine_kind,
+            image_ref,
+            &cache_identity,
+        )
+        .await?;
+        #[cfg(not(windows))]
         self.build_cached_local_image_rootfs_image(sandbox_id, docker, image_ref, &cache_identity)
             .await?;
         self.publish_pulled_event(sandbox_id, image_ref, &image_path)
@@ -3624,7 +3707,7 @@ impl VmDriver {
         image_ref: &str,
         bootstrap_root_disk: &Path,
     ) -> Result<PreparedImageDisk, Status> {
-        if let Some((docker, image_identity)) =
+        if let Some((docker, _engine_kind, image_identity)) =
             self.resolve_local_container_image(image_ref).await?
         {
             return self
@@ -4246,6 +4329,7 @@ impl VmDriver {
         );
     }
 
+    #[cfg(not(windows))]
     #[allow(clippy::similar_names)]
     async fn build_cached_local_image_rootfs_image(
         &self,
@@ -4369,6 +4453,106 @@ impl VmDriver {
         Ok(())
     }
 
+    #[cfg(windows)]
+    async fn build_cached_local_image_rootfs_image(
+        &self,
+        sandbox_id: &str,
+        engine_kind: LocalContainerEngine,
+        image_ref: &str,
+        image_identity: &str,
+    ) -> Result<(), Status> {
+        let source = format!("{}{image_ref}", engine_kind.ext4kit_transport());
+        self.build_windows_rootfs_image_from_source(
+            sandbox_id,
+            &source,
+            image_ref,
+            engine_kind.image_source(),
+            image_identity,
+        )
+        .await
+    }
+
+    #[allow(clippy::similar_names)]
+    /// Windows cannot unpack a Linux rootfs onto NTFS (symlinks, modes,
+    /// owners), so ext4kit streams the pinned registry image straight into
+    /// ext4 and `ext4kit edit` applies what `prepare_sandbox_rootfs` does on
+    /// Linux and macOS with debugfs.
+    #[cfg(windows)]
+    async fn build_windows_bootstrap_rootfs_image(
+        &self,
+        sandbox_id: &str,
+        reference: &Reference,
+        image_ref: &str,
+        image_identity: &str,
+    ) -> Result<(), Status> {
+        let source = format!("docker://{}", reference.whole());
+        self.build_windows_rootfs_image_from_source(
+            sandbox_id,
+            &source,
+            image_ref,
+            "registry",
+            image_identity,
+        )
+        .await
+    }
+
+    #[cfg(windows)]
+    async fn build_windows_rootfs_image_from_source(
+        &self,
+        sandbox_id: &str,
+        source: &str,
+        image_ref: &str,
+        image_source: &str,
+        image_identity: &str,
+    ) -> Result<(), Status> {
+        let cache_dir = image_cache_dir(&self.config.state_dir, image_identity);
+        let image_path = image_cache_rootfs_image(&self.config.state_dir, image_identity);
+        let staging_dir = self.image_staging_dir(image_identity);
+        let prepared_image = staging_dir.join(IMAGE_CACHE_ROOTFS_IMAGE);
+        tokio::fs::create_dir_all(&cache_dir)
+            .await
+            .map_err(|err| Status::internal(format!("create image cache dir failed: {err}")))?;
+        self.reset_image_staging_dir(&staging_dir).await?;
+
+        self.publish_vm_progress(
+            sandbox_id,
+            "PreparingRootfs",
+            format!("Preparing VM rootfs for image \"{image_ref}\" with ext4kit"),
+            HashMap::from([
+                ("image_ref".to_string(), image_ref.to_string()),
+                ("image_source".to_string(), image_source.to_string()),
+                ("image_identity".to_string(), image_identity.to_string()),
+            ]),
+        );
+        let source = source.to_string();
+        let staging_for_build = staging_dir.clone();
+        let prepared_for_build = prepared_image.clone();
+        let identity = image_identity.to_string();
+        let sandbox_identity = configured_sandbox_identity(&self.config);
+        let result = tokio::task::spawn_blocking(move || {
+            crate::rootfs::create_bootstrap_rootfs_image(
+                &source,
+                &staging_for_build,
+                &prepared_for_build,
+                &identity,
+                sandbox_identity,
+            )
+        })
+        .await
+        .map_err(|err| Status::internal(format!("image rootfs build panicked: {err}")))?
+        .map_err(Status::failed_precondition);
+        if let Err(err) = result {
+            warn!(image_ref = %image_ref, error = %err.message(), "vm driver: rootfs image build failed");
+            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            return Err(err);
+        }
+        self.publish_prepared_image(&prepared_image, &image_path)
+            .await?;
+        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        Ok(())
+    }
+
+    #[cfg_attr(windows, allow(dead_code))]
     #[allow(clippy::similar_names)]
     async fn build_cached_registry_image_rootfs_image(
         &self,
@@ -4705,6 +4889,15 @@ impl VmDriver {
         });
     }
 
+    /// Remove a sandbox's socket directory. Unix unlinks relative to the pinned
+    /// socket-root fd; Windows removes by path under the per-user socket root.
+    fn remove_sandbox_socket_dir(&self, sandbox_id: &str) {
+        #[cfg(unix)]
+        remove_sandbox_socket_dir(&self.socket_root_fd, sandbox_id);
+        #[cfg(not(unix))]
+        remove_sandbox_socket_dir(&self.socket_root, sandbox_id);
+    }
+
     fn publish_vm_progress(
         &self,
         sandbox_id: &str,
@@ -4726,6 +4919,9 @@ impl VmDriver {
 pub async fn run_image_preparation_worker(request_path: &Path) -> Result<(), String> {
     let (request, directory) = preparation::read_request(request_path)?;
     validate_sandbox_id(&request.sandbox_id).map_err(|error| error.message().to_string())?;
+    // Windows workers run inside the kill-on-close Job Object of the driver,
+    // which already takes them down with it.
+    #[cfg(unix)]
     preparation::watch_parent(request.parent_pid)?;
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -4733,9 +4929,13 @@ pub async fn run_image_preparation_worker(request_path: &Path) -> Result<(), Str
         .try_init()
         .map_err(|error| format!("initialize image preparation logging: {error}"))?;
     let (events, mut receiver) = broadcast::channel(WATCH_BUFFER);
-    let socket_root_fd = fs::File::open(&directory)
+    #[cfg(unix)]
+    let socket_root_fd: SocketRootFd = fs::File::open(&directory)
         .map_err(|error| error.to_string())?
         .into();
+    #[cfg(windows)]
+    let socket_root_fd: SocketRootFd =
+        open_directory_handle_nofollow(&directory).map_err(|error| error.to_string())?;
     let launcher_bin = request
         .config
         .launcher_bin
@@ -5357,30 +5557,85 @@ fn parse_registry_reference(image_ref: &str) -> Result<Reference, Status> {
 /// Try to connect to a local container engine (Docker or Podman).
 ///
 /// Tries Docker first (`connect_with_local_defaults`, which respects
-/// `DOCKER_HOST`). If Docker is unavailable, falls back to the Podman
-/// socket, which exposes a Docker-compatible API.
-async fn connect_local_container_engine() -> Option<Docker> {
+/// `DOCKER_HOST`) and then probes the Podman socket or named pipe. Each
+/// connected engine is retained so image lookup and ext4kit use the same one.
+#[derive(Clone, Copy, Debug)]
+enum LocalContainerEngine {
+    Docker,
+    Podman,
+}
+
+impl LocalContainerEngine {
+    const fn image_source(self) -> &'static str {
+        match self {
+            Self::Docker => "local_docker",
+            Self::Podman => "local_podman",
+        }
+    }
+
+    /// The source prefix ext4kit imports the image through; only the
+    /// Windows driver hands image extraction to ext4kit.
+    #[cfg(windows)]
+    const fn ext4kit_transport(self) -> &'static str {
+        match self {
+            Self::Docker => "docker-daemon:",
+            Self::Podman => "containers-storage:",
+        }
+    }
+}
+
+async fn connect_local_container_engines() -> Vec<(Docker, LocalContainerEngine)> {
+    let mut engines = Vec::new();
     if let Ok(docker) = Docker::connect_with_local_defaults()
         && docker.ping().await.is_ok()
     {
-        return Some(docker);
+        engines.push((docker, LocalContainerEngine::Docker));
     }
 
-    let podman_socket = detect_podman_socket()?;
-    if let Ok(docker) =
-        Docker::connect_with_unix(podman_socket.to_str()?, 120, bollard::API_DEFAULT_VERSION)
-        && docker.ping().await.is_ok()
+    #[cfg(unix)]
     {
-        info!(
-            socket = %podman_socket.display(),
-            "vm driver: connected to Podman (Docker-compatible API)"
-        );
-        return Some(docker);
+        if let Some(podman_socket) = detect_podman_socket()
+            && let Some(socket) = podman_socket.to_str()
+            && let Ok(docker) = Docker::connect_with_unix(socket, 120, bollard::API_DEFAULT_VERSION)
+            && docker.ping().await.is_ok()
+        {
+            info!(
+                socket = %podman_socket.display(),
+                "vm driver: connected to Podman (Docker-compatible API)"
+            );
+            engines.push((docker, LocalContainerEngine::Podman));
+        }
     }
 
-    None
+    #[cfg(windows)]
+    {
+        let podman_pipes = std::env::var("CONTAINER_HOST")
+            .into_iter()
+            .chain(std::iter::once(
+                "//./pipe/podman-machine-default".to_owned(),
+            ));
+        for podman_pipe in podman_pipes {
+            let podman_pipe = podman_pipe.strip_prefix("npipe://").unwrap_or(&podman_pipe);
+            if podman_pipe.contains("://") {
+                continue;
+            }
+            if let Ok(docker) =
+                Docker::connect_with_named_pipe(podman_pipe, 120, bollard::API_DEFAULT_VERSION)
+                && docker.ping().await.is_ok()
+            {
+                info!(
+                    pipe = %podman_pipe,
+                    "vm driver: connected to Podman (Docker-compatible API)"
+                );
+                engines.push((docker, LocalContainerEngine::Podman));
+            }
+        }
+    }
+
+    engines
 }
 
+#[cfg(unix)]
 fn detect_podman_socket() -> Option<PathBuf> {
     openshell_driver_podman::driver::detect_socket()
 }
@@ -6294,18 +6549,313 @@ async fn restrict_owner_only_dir(path: &Path) -> Result<(), std::io::Error> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unused_async)]
 async fn restrict_owner_only_dir(_path: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
 const SOCKET_ROOT_ALLOC_RETRIES: usize = 16;
 /// macOS `sun_path` is 104 bytes including the NUL terminator.
+#[cfg(not(windows))]
 const MAX_SUN_PATH_LEN: usize = 103;
+/// Windows `sun_path` is 108 bytes including the NUL terminator.
+#[cfg(windows)]
+const MAX_SUN_PATH_LEN: usize = 107;
 
 fn sandbox_socket_dir(socket_root: &Path, sandbox_id: &str) -> PathBuf {
     socket_root.join(sandbox_id)
 }
 
+fn socket_path_len(path: &Path) -> usize {
+    #[cfg(windows)]
+    {
+        // Winsock AF_UNIX stores paths as UTF-8 bytes in `sun_path`.
+        path.to_str().map_or(usize::MAX, str::len)
+    }
+    #[cfg(not(windows))]
+    {
+        path.as_os_str().len()
+    }
+}
+
+#[cfg(windows)]
+pub struct LocalAllocGuard(*mut std::ffi::c_void);
+
+#[cfg(windows)]
+impl LocalAllocGuard {
+    /// Raw `LocalAlloc` pointer owned by the guard.
+    pub fn as_ptr(&self) -> *mut std::ffi::c_void {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for LocalAllocGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: Windows security conversion APIs allocate these buffers with LocalAlloc.
+            unsafe { LocalFree(self.0) };
+        }
+    }
+}
+
+/// Self-relative security descriptor granting full access to the current
+/// user's SID only — the Win32 equivalent of a `chmod 0600` object.
+#[cfg(windows)]
+pub fn current_user_security_descriptor() -> Result<LocalAllocGuard, std::io::Error> {
+    let sid = current_process_user_sid_string()?;
+
+    let sddl = format!("D:P(A;OICI;FA;;;{sid})");
+    let sddl_wide = sddl
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut descriptor = null_mut();
+    // SAFETY: The SDDL input is NUL-terminated and the output pointer is writable.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_wide.as_ptr(),
+            SDDL_REVISION_1,
+            &raw mut descriptor,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(LocalAllocGuard(descriptor))
+}
+
+/// Open the access token of `process` for query.
+#[cfg(windows)]
+fn open_process_token_for_query(process: HANDLE) -> Result<OwnedHandle, std::io::Error> {
+    let mut token_handle = null_mut();
+    // SAFETY: The process handle is valid and the output pointer is writable.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token_handle) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: OpenProcessToken succeeded and transfers ownership of the handle to the caller.
+    Ok(unsafe { OwnedHandle::from_raw_handle(token_handle) })
+}
+
+/// User SID of the account owning `token`, in SDDL form (e.g. `S-1-5-21-...`).
+#[cfg(windows)]
+fn token_user_sid_string(token: &OwnedHandle) -> Result<String, std::io::Error> {
+    let mut token_info_size = 0u32;
+    // SAFETY: This is the documented sizing query; the null buffer has length zero.
+    unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            null_mut(),
+            0,
+            &raw mut token_info_size,
+        );
+    }
+    if token_info_size == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // `Vec<usize>` keeps the TOKEN_USER buffer suitably aligned for its pointer fields.
+    let word_count = (token_info_size as usize).div_ceil(size_of::<usize>());
+    let mut token_info = vec![0usize; word_count];
+    // SAFETY: The buffer is large enough, aligned, and writable for the requested token data.
+    if unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            token_info.as_mut_ptr().cast(),
+            token_info_size,
+            &raw mut token_info_size,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // SAFETY: GetTokenInformation filled the aligned buffer with TOKEN_USER data.
+    let token_user = unsafe { &*token_info.as_ptr().cast::<TOKEN_USER>() };
+    if token_user.User.Sid.is_null() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "process token has no user SID",
+        ));
+    }
+
+    let mut sid_text = null_mut();
+    // SAFETY: The SID pointer belongs to the live TOKEN_USER buffer and the output pointer is writable.
+    if unsafe { ConvertSidToStringSidW(token_user.User.Sid, &raw mut sid_text) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let sid_text_guard = LocalAllocGuard(sid_text.cast());
+    let mut sid_length = 0usize;
+    // SAFETY: The API returned a valid NUL-terminated UTF-16 SID string.
+    while unsafe { *sid_text.add(sid_length) } != 0 {
+        sid_length += 1;
+    }
+    // SAFETY: The slice covers the SID string excluding its terminator and remains live under the guard.
+    let sid = String::from_utf16(unsafe { std::slice::from_raw_parts(sid_text, sid_length) })
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    drop(sid_text_guard);
+    Ok(sid)
+}
+
+/// User SID of the account running this process, in SDDL form.
+#[cfg(windows)]
+pub fn current_process_user_sid_string() -> Result<String, std::io::Error> {
+    // SAFETY: GetCurrentProcess returns a valid pseudo-handle.
+    let token = open_process_token_for_query(unsafe { GetCurrentProcess() })?;
+    token_user_sid_string(&token)
+}
+
+/// User SID of the account running `pid`, in SDDL form. Fails when the
+/// process cannot be opened for query (already exited, access denied).
+#[cfg(windows)]
+pub fn process_user_sid_string(pid: u32) -> Result<String, std::io::Error> {
+    // SAFETY: The PID comes from a connected local client and the access right is read-only.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: OpenProcess succeeded and transfers ownership of the handle to the guard.
+    let process = unsafe { OwnedHandle::from_raw_handle(process) };
+    let token = open_process_token_for_query(process.as_raw_handle())?;
+    token_user_sid_string(&token)
+}
+
+#[cfg(windows)]
+fn open_directory_handle_nofollow(path: &Path) -> Result<OwnedHandle, std::io::Error> {
+    let path_wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // OPEN_REPARSE_POINT opens the final path component itself; omitting SHARE_DELETE keeps
+    // the created root from being renamed or replaced while this handle is alive.
+    // SAFETY: `path_wide` is NUL-terminated and the other arguments are valid Win32 constants.
+    let handle = unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(handle.as_raw_handle(), &raw mut info) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+        || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "socket root {} is not a non-reparse directory",
+                path.display()
+            ),
+        ));
+    }
+    Ok(handle)
+}
+
+#[cfg(windows)]
+fn allocate_socket_root() -> Result<(PathBuf, SocketRootFd), std::io::Error> {
+    // AF_UNIX paths on Windows are limited to 108 bytes; keep the root short.
+    let base = std::env::temp_dir();
+    let security_descriptor = current_user_security_descriptor()?;
+    let security_attributes = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(u32::MAX),
+        lpSecurityDescriptor: security_descriptor.0,
+        bInheritHandle: 0,
+    };
+
+    for _ in 0..SOCKET_ROOT_ALLOC_RETRIES {
+        let random = u64::from_ne_bytes(
+            openshell_crypto::random_bytes::<8>().map_err(std::io::Error::other)?,
+        );
+        let long_root = base.join(format!("os-{random:016x}"));
+        let short_root = base.join(format!("os-{:08x}", random & 0xffff_ffff));
+        let short_socket_path_len =
+            |root: &Path| socket_path_len(&root.join("x").join(VM_CONTROL_SOCKET));
+        // Keep 64 bits of entropy when the temp path leaves enough room. On a
+        // tight path, retain the old short suffix if it can still fit a socket.
+        let root = if short_socket_path_len(&long_root) <= MAX_SUN_PATH_LEN
+            || short_socket_path_len(&short_root) > MAX_SUN_PATH_LEN
+        {
+            long_root
+        } else {
+            short_root
+        };
+        let root_wide = root
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+
+        // The directory's DACL is installed as part of creation, so there is
+        // no interval in which it inherits broader permissions from the temp dir.
+        // SAFETY: `root_wide` is NUL-terminated and the descriptor remains live above.
+        if unsafe { CreateDirectoryW(root_wide.as_ptr(), &raw const security_attributes) } != 0 {
+            let handle = open_directory_handle_nofollow(&root)?;
+            return Ok((root, handle));
+        }
+
+        let error = std::io::Error::last_os_error();
+        let already_exists = error.raw_os_error().is_some_and(|code| {
+            let code = code.unsigned_abs();
+            code == ERROR_ALREADY_EXISTS || code == ERROR_FILE_EXISTS
+        });
+        if already_exists {
+            continue;
+        }
+        return Err(error);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "failed to allocate socket root under {} after {SOCKET_ROOT_ALLOC_RETRIES} attempts",
+            base.display()
+        ),
+    ))
+}
+
+#[cfg(not(unix))]
+fn create_sandbox_socket_dir(
+    _root: &SocketRootFd,
+    socket_root: &Path,
+    sandbox_id: &str,
+) -> Result<PathBuf, std::io::Error> {
+    let longest = socket_root.join(sandbox_id).join(VM_CONTROL_SOCKET);
+    if socket_path_len(&longest) > MAX_SUN_PATH_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "socket path {} exceeds sun_path limit ({MAX_SUN_PATH_LEN} bytes)",
+                longest.display()
+            ),
+        ));
+    }
+    fs::create_dir_all(socket_root.join(sandbox_id))?;
+    Ok(socket_root.join(sandbox_id))
+}
+
+#[cfg(not(unix))]
+fn remove_sandbox_socket_dir(socket_root: &Path, sandbox_id: &str) {
+    let dir = socket_root.join(sandbox_id);
+    let _ = fs::remove_file(dir.join(VM_CONTROL_SOCKET));
+    let _ = fs::remove_file(dir.join("ssh.sock"));
+    let _ = fs::remove_dir(&dir);
+}
+
+#[cfg(unix)]
 fn allocate_socket_root() -> Result<(PathBuf, OwnedFd), std::io::Error> {
     let uid = rustix::process::geteuid().as_raw();
     allocate_socket_root_with(Path::new("/tmp"), || {
@@ -6316,6 +6866,7 @@ fn allocate_socket_root() -> Result<(PathBuf, OwnedFd), std::io::Error> {
     })
 }
 
+#[cfg(unix)]
 fn allocate_socket_root_with(
     base: &Path,
     mut gen_name: impl FnMut() -> Result<String, std::io::Error>,
@@ -6347,13 +6898,14 @@ fn allocate_socket_root_with(
     ))
 }
 
+#[cfg(unix)]
 fn create_sandbox_socket_dir(
     root_fd: &OwnedFd,
     socket_root: &Path,
     sandbox_id: &str,
 ) -> Result<PathBuf, std::io::Error> {
     let longest = socket_root.join(sandbox_id).join(VM_CONTROL_SOCKET);
-    if longest.as_os_str().len() > MAX_SUN_PATH_LEN {
+    if socket_path_len(&longest) > MAX_SUN_PATH_LEN {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
@@ -6369,6 +6921,7 @@ fn create_sandbox_socket_dir(
     Ok(socket_root.join(sandbox_id))
 }
 
+#[cfg(unix)]
 fn remove_sandbox_socket_dir(root_fd: &OwnedFd, sandbox_id: &str) {
     if let Ok(leaf_fd) = rustix::fs::openat(
         root_fd,
@@ -6968,6 +7521,7 @@ async fn restrict_owner_read_write(path: &Path) -> Result<(), std::io::Error> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unused_async)]
 async fn restrict_owner_read_write(_path: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
@@ -7520,6 +8074,7 @@ async fn terminate_vm_process_within(
     child: &mut Child,
     grace: Duration,
 ) -> Result<ExitStatus, std::io::Error> {
+    #[cfg(unix)]
     if let Some(pid) = child.id()
         && let Err(err) = kill(Pid::from_raw(pid.cast_signed()), Signal::SIGTERM)
         && err != Errno::ESRCH
@@ -7528,6 +8083,12 @@ async fn terminate_vm_process_within(
             "send SIGTERM to vm process {pid}: {err}"
         )));
     }
+    // Windows has no SIGTERM to wait on; terminate the process right away.
+    #[cfg(not(unix))]
+    let grace = {
+        let _ = grace;
+        Duration::ZERO
+    };
 
     if let Ok(status) = tokio::time::timeout(grace, child.wait()).await {
         status
@@ -7555,6 +8116,9 @@ async fn terminate_sandbox_processes_within(
         .inspect(|status| {
             // An orderly shutdown returns the workload's exit code, which can
             // be nonzero even after the guest acknowledges termination.
+            #[cfg(not(unix))]
+            let _ = (status, supervisor_pid);
+            #[cfg(unix)]
             if status.signal().is_some() {
                 warn!(
                     ?supervisor_pid,
@@ -7588,6 +8152,19 @@ fn absolute_state_dir(state_dir: &Path) -> Result<PathBuf, String> {
 
 fn isolate_host_control_environment(command: &mut Command) {
     command.env_clear();
+    // The WinSock2 catalog stores provider library paths as
+    // `%SystemRoot%\system32\...` placeholders that WSAStartup expands from
+    // the process environment; without SystemRoot every socket call in the
+    // supervisor fails with WSAEPROVIDERFAILEDINIT (10106). MSYS shells
+    // re-inject SystemRoot into native children, which is why shell-based
+    // reproduction never showed the failure.
+    #[cfg(windows)]
+    for (name, value) in std::env::vars_os() {
+        let name = name.to_string_lossy();
+        if name.eq_ignore_ascii_case("SystemRoot") || name.eq_ignore_ascii_case("SystemDrive") {
+            command.env(&*name, value);
+        }
+    }
 }
 
 #[tracing::instrument(
@@ -7808,7 +8385,7 @@ fn pulling_layer_detail(metadata: &HashMap<String, String>) -> Option<String> {
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::gpu::allocate_vsock_cid;

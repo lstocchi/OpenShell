@@ -61,6 +61,13 @@ impl RuntimeInitiatedListener {
             SandboxTransport::RuntimeInitiatedUnix { socket_path } => {
                 Listener::bind_unix(socket_path).map_err(unavailable)?
             }
+            // libkrun's Windows port proxies the guest vsock connection to a
+            // WinSock AF_UNIX socket; tokio has no AF_UNIX there, so the
+            // listener lives in `winsock_unix` with its own async bridge.
+            #[cfg(windows)]
+            SandboxTransport::RuntimeInitiatedUnix { socket_path } => {
+                Listener::bind_windows_unix(socket_path).map_err(unavailable)?
+            }
             #[cfg(target_os = "linux")]
             SandboxTransport::RuntimeInitiatedVsock { guest_cid, port } => {
                 Listener::bind_vsock(*guest_cid, *port).map_err(unavailable)?
@@ -196,6 +203,10 @@ enum Listener {
         path: std::path::PathBuf,
         inode: u64,
     },
+    #[cfg(windows)]
+    WindowsUnix {
+        listener: openshell_core::winsock_unix::UnixListener,
+    },
     #[cfg(target_os = "linux")]
     Vsock {
         listener: tokio::io::unix::AsyncFd<socket2::Socket>,
@@ -249,6 +260,13 @@ impl Listener {
         })
     }
 
+    #[cfg(windows)]
+    fn bind_windows_unix(path: &std::path::Path) -> std::io::Result<Self> {
+        Ok(Self::WindowsUnix {
+            listener: openshell_core::winsock_unix::UnixListener::bind(path)?,
+        })
+    }
+
     #[cfg(target_os = "linux")]
     fn bind_vsock(guest_cid: u32, port: u32) -> std::io::Result<Self> {
         let socket = socket2::Socket::new(socket2::Domain::VSOCK, socket2::Type::STREAM, None)?;
@@ -271,6 +289,11 @@ impl Listener {
             }
             #[cfg(unix)]
             Self::Unix { listener, .. } => Ok(Box::new(listener.accept().await?.0)),
+            #[cfg(windows)]
+            Self::WindowsUnix { listener } => {
+                let stream = listener.accept().await?;
+                Ok(Box::new(stream))
+            }
             #[cfg(target_os = "linux")]
             Self::Vsock {
                 listener,

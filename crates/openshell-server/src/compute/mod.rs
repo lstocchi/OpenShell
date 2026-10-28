@@ -417,11 +417,14 @@ pub use openshell_core::ComputeDriverError as ComputeError;
 #[derive(Debug)]
 pub struct ManagedDriverProcess {
     child: std::sync::Mutex<Option<tokio::process::Child>>,
+    /// Listen socket of the managed driver; only read on Unix where the
+    /// socket is a filesystem node the gateway has to unlink. Windows named
+    /// pipes disappear with the driver process instead.
+    #[cfg_attr(not(unix), allow(dead_code))]
     socket_path: PathBuf,
 }
 
 impl ManagedDriverProcess {
-    #[cfg(unix)]
     pub fn new(child: tokio::process::Child, socket_path: PathBuf) -> Self {
         Self {
             child: std::sync::Mutex::new(Some(child)),
@@ -467,6 +470,30 @@ impl ManagedDriverProcess {
             }
         }
     }
+
+    #[cfg(windows)]
+    async fn shutdown(&self) -> Result<(), String> {
+        let child = self
+            .child
+            .lock()
+            .map_err(|_| "managed compute-driver process lock poisoned".to_string())?
+            .take();
+        let Some(mut child) = child else {
+            return Ok(());
+        };
+
+        // Windows has no signals to ask the driver to exit gracefully, so
+        // terminate it directly; the driver's job object reaps any VMs and
+        // sandbox state it launched.
+        child
+            .start_kill()
+            .map_err(|err| format!("failed to terminate managed compute driver: {err}"))?;
+        child
+            .wait()
+            .await
+            .map(|_| ())
+            .map_err(|err| format!("failed to reap managed compute driver: {err}"))
+    }
 }
 
 impl Drop for ManagedDriverProcess {
@@ -474,6 +501,9 @@ impl Drop for ManagedDriverProcess {
         if let Ok(mut child) = self.child.lock() {
             let _ = child.take();
         }
+        // On Unix the listen socket is a filesystem node the gateway owns;
+        // on Windows it is a named pipe that disappears with the driver.
+        #[cfg(unix)]
         let _ = std::fs::remove_file(&self.socket_path);
     }
 }
@@ -3488,15 +3518,11 @@ impl ComputeRuntime {
     pub async fn cleanup_on_shutdown(&self) -> Result<(), String> {
         let stop_result = self.stop_persisted_sandboxes_on_shutdown().await;
 
-        #[cfg(unix)]
         let process_result = if let Some(process) = &self.driver_process {
             process.shutdown().await
         } else {
             Ok(())
         };
-
-        #[cfg(not(unix))]
-        let process_result: Result<(), String> = Ok(());
 
         match (stop_result, process_result) {
             (Ok(()), Ok(())) => Ok(()),

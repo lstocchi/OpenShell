@@ -3,6 +3,7 @@
 
 //! Unix-socket address helpers shared by the SSH server and relay client.
 
+#[cfg(unix)]
 use std::borrow::Cow;
 use std::path::Path;
 #[cfg(target_os = "linux")]
@@ -27,6 +28,7 @@ pub fn is_abstract(path: &Path) -> bool {
 
 /// Translate the configured `@name` spelling into Tokio's NUL-prefixed Linux
 /// abstract-socket path representation.
+#[cfg(unix)]
 pub fn runtime_path(path: &Path) -> Cow<'_, Path> {
     #[cfg(target_os = "linux")]
     {
